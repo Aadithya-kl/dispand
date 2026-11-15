@@ -15,6 +15,7 @@ import { agentInUse } from "../workflows/procedures.ts";
 import { assistantGuard, ensureAssistant, findAssistant } from "./builtin.ts";
 import { consultsOf, pairProblem, setConsults, type ConsultEntry } from "./consults.ts";
 import { lockConsults } from "../engine/consults.ts";
+import { leftOut } from "../engine/tooling.ts";
 import { skillsAndTools } from "./skills-and-tools.ts";
 import { Permission, setPermission, toolPermissionTarget } from "./tool-ask.ts";
 import { effectiveTools } from "./tools.ts";
@@ -181,6 +182,20 @@ async function attach(tx: Tx, ownerId: string, agentId: string, packageIds: stri
   }
 }
 
+/**
+ * What a CLI session of the agent will leave out, past the limits of `tooling.ts`, for the page to
+ * warn about; nothing for a cloud harness, or when everything fits.
+ */
+async function sessionLeftOut(db: Db | Tx, agentId: string, harnessRunnerId: string | null) {
+  if (harnessRunnerId === null) return {};
+  const { skills, tools } = await skillsAndTools(db, agentId);
+  // Only the harness's runner's tools reach its sessions (`runnerServers`): one retargeted since doesn't count.
+  const ids = tools.filter((t) => t.kind === "runner").map((t) => t.toolId);
+  const here = new Set(ids.length ? (await db.select({ id: toolsTable.id }).from(toolsTable).where(and(inArray(toolsTable.id, ids), eq(toolsTable.runnerId, harnessRunnerId)))).map((t) => t.id) : []);
+  const out = leftOut(skills, tools.filter((t) => here.has(t.toolId)));
+  return out.skills.names.length || out.runnerTools.names.length ? { leftOut: out } : {};
+}
+
 /** Makes these the agents it may consult, refused with the reason a new entry can't be made. */
 async function consults(tx: Tx, ownerId: string, agentId: string, entries: ConsultEntry[] | undefined) {
   if (entries === undefined) return;
@@ -196,9 +211,11 @@ async function consults(tx: Tx, ownerId: string, agentId: string, entries: Consu
 async function withSkillsAndTools(db: Db, row: Row) {
   const [agent] = await withPlugins(db, [row]);
   const entries = await consultsOf(db, row.id);
+  const [harness] = await db.select({ runnerId: harnesses.runnerId }).from(harnesses).where(eq(harnesses.id, row.harnessId));
   return {
     ...agent!,
     ...(await skillsAndTools(db, row.id)),
+    ...(await sessionLeftOut(db, row.id, harness?.runnerId ?? null)),
     consults: await Promise.all(entries.map(async (e) => ({ ...e, inactive: await pairProblem(db, row.ownerId, row.id, e.agentId) }))),
   };
 }
@@ -232,7 +249,7 @@ const create = owner.input(AgentFields).handler(async ({ input, context }) => {
     await consults(tx, context.ownerId, row!.id, entries);
     return row!;
   });
-  return (await withPlugins(context.db, [row]))[0]!;
+  return { ...(await withPlugins(context.db, [row]))[0]!, ...(await sessionLeftOut(context.db, row.id, harness.runnerId)) };
 });
 
 const update = owner.input(AgentFields.extend({ id: z.string() })).handler(async ({ input, context }) => {
@@ -265,7 +282,7 @@ const update = owner.input(AgentFields.extend({ id: z.string() })).handler(async
   });
   context.engine.settled(ended);
   await context.engine.narrowSessions(id, context.db);
-  return (await withPlugins(context.db, [row]))[0]!;
+  return { ...(await withPlugins(context.db, [row]))[0]!, ...(await sessionLeftOut(context.db, id, harness.runnerId)) };
 });
 
 const remove = owner.input(z.object({ id: z.string() })).handler(async ({ input, context }) => {
