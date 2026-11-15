@@ -1,6 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import { MAX_CLI_RULE_LENGTH } from "@dispand/runner-protocol";
-import { and, asc, eq, inArray, notInArray } from "drizzle-orm";
+import { and, asc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { Db } from "../db/client.ts";
 import { agents as agentsTable, agentSkills, agentSkillToolPermissions, agentTools, harnesses, plugins, skillPackages, tables as tablesTable, tools as toolsTable } from "../db/schema.ts";
@@ -17,7 +17,7 @@ import { consultsOf, pairProblem, setConsults, type ConsultEntry } from "./consu
 import { lockConsults } from "../engine/consults.ts";
 import { leftOut } from "../engine/tooling.ts";
 import { skillsAndTools } from "./skills-and-tools.ts";
-import { Permission, setPermission, toolPermissionTarget } from "./tool-ask.ts";
+import { FROZEN_REVISION, heldUnasked, Permission, setPermission, strictTargets, toolPermissionTarget } from "./tool-ask.ts";
 import { effectiveTools } from "./tools.ts";
 import { overriddenAfter, refuseOwnDelete, sameValue } from "../plugins/overrides.ts";
 import { agentValues } from "../plugins/update.ts";
@@ -129,7 +129,7 @@ async function find(db: Db, ownerId: string, id: string) {
  * are locked (shared) so a package or tool can't be deleted while it is being attached. Every
  * runner tool it gets, a skill's required ones included, must run on the harness's runner.
  */
-async function attach(tx: Tx, ownerId: string, agentId: string, packageIds: string[], toolIds: string[], harnessRunnerId: string | null, permissions: { toolId: string; unasked: string[] }[] = [], targets?: { toolId: string; target: string }[]) {
+async function attach(tx: Tx, ownerId: string, agentId: string, packageIds: string[], toolIds: string[], harnessRunnerId: string | null, permissions: { toolId: string; unasked: string[] }[] = [], targets?: { toolId: string; target: string; strictTarget?: string }[]) {
   if (permissions.some((p) => !toolIds.includes(p.toolId))) throw new ORPCError("BAD_REQUEST", { message: "Each tool permission must name a chosen tool" });
   if (new Set(permissions.map((p) => p.toolId)).size !== permissions.length) throw new ORPCError("BAD_REQUEST", { message: "List each tool's permissions once" });
   const pkgs = packageIds.length
@@ -142,7 +142,7 @@ async function attach(tx: Tx, ownerId: string, agentId: string, packageIds: stri
   if (pkgs.length !== packageIds.length) throw new ORPCError("NOT_FOUND", { message: "Skill not found" });
   const found = toolIds.length
     ? await tx
-        .select({ id: toolsTable.id, actions: toolsTable.actions, catalogId: toolsTable.catalogId, kind: toolsTable.kind, url: toolsTable.url, urlSealed: toolsTable.urlSealed, transport: toolsTable.transport, runnerId: toolsTable.runnerId, runnerTool: toolsTable.runnerTool, permissionRevision: toolsTable.permissionRevision, disabled: toolsTable.disabled })
+        .select({ id: toolsTable.id, actions: toolsTable.actions, catalogId: toolsTable.catalogId, kind: toolsTable.kind, url: toolsTable.url, urlSealed: toolsTable.urlSealed, transport: toolsTable.transport, runnerId: toolsTable.runnerId, runnerTool: toolsTable.runnerTool, permissionRevision: toolsTable.permissionRevision, disabled: toolsTable.disabled, pluginId: toolsTable.pluginId, actionsError: toolsTable.actionsError })
         .from(toolsTable)
         .where(and(inArray(toolsTable.id, toolIds), eq(toolsTable.ownerId, ownerId)))
         .for("share")
@@ -171,18 +171,26 @@ async function attach(tx: Tx, ownerId: string, agentId: string, packageIds: stri
   await tx.delete(agentSkillToolPermissions).where(packageIds.length ? and(mine, notInArray(agentSkillToolPermissions.skillPackageId, packageIds)) : mine);
   // A tool the agent now chooses itself: its own row takes over (removing it later revives nothing), keeping a remembered Off.
   const shadowed = toolIds.length ? await tx.delete(agentSkillToolPermissions).where(and(mine, inArray(agentSkillToolPermissions.toolId, toolIds))).returning() : [];
+  // Under strict permissions, lists written now are bound to what the agent and its tools are now; kept ones keep theirs.
+  const strict = await strictTargets(tx, ownerId, agentId, found, []);
+  // An approved proposal's list holds only for the tool it was frozen for.
+  const frozen = targets ? await strictTargets(tx, ownerId, agentId, found, [], FROZEN_REVISION) : null;
   if (toolIds.length) {
     await tx.insert(agentTools).values(
       toolIds.map((toolId) => {
         const tool = found.find((t) => t.id === toolId)!;
         const denied = kept.get(toolId)?.denied ?? [...new Set(shadowed.filter((r) => r.toolId === toolId && r.target === toolPermissionTarget(tool)).flatMap((r) => r.denied))];
-        const requested = permissions.find((p) => p.toolId === toolId)?.unasked;
+        const current = frozen?.(tool);
+        const reviewed = !frozen || (current !== null && targets!.find((t) => t.toolId === toolId)?.strictTarget === current);
+        // Unverified: a tool it had keeps its list (asking under strict), one it gains asks for everything, never its fresh defaults.
+        const given = permissions.find((p) => p.toolId === toolId)?.unasked;
+        const requested = reviewed || !given ? given : kept.has(toolId) ? undefined : [];
         if (requested?.some((action) => tool.disabled.includes(action))) throw new ORPCError("BAD_REQUEST", { message: "An action is disabled workspace-wide" });
         const latent = (kept.get(toolId)?.unasked ?? []).filter((action) => tool.disabled.includes(action));
         // An Off carried over from the skill wins over defaults, a proposal's frozen ones included.
         const unasked = (requested ? [...new Set([...requested, ...latent])] : kept.get(toolId)?.unasked ?? defaultUnasked(tool)).filter((action) => kept.has(toolId) || !denied.includes(action));
         if (unasked.some((action) => denied.includes(action))) throw new ORPCError("CONFLICT", { message: "An action is disabled: change its permission explicitly before granting it" });
-        return { agentId, toolId, unasked, denied };
+        return { agentId, toolId, unasked, denied, strictTarget: requested || !kept.has(toolId) ? (strict?.(tool) ?? null) : kept.get(toolId)!.strictTarget };
       }),
     );
   }
@@ -277,7 +285,7 @@ const update = owner.input(AgentFields.extend({ id: z.string() })).handler(async
     }
     const [row] = await tx
       .update(agentsTable)
-      .set({ ...fields, model: fields.model ?? null, ...(bundles ? { bundles } : {}), ...(selfLearning ? { selfLearning } : {}), ...(dataTables ? { dataTables } : {}), overridden })
+      .set({ ...fields, model: fields.model ?? null, ...(bundles ? { bundles } : {}), ...(selfLearning ? { selfLearning } : {}), ...(dataTables ? { dataTables } : {}), overridden, revision: sql`${agentsTable.revision} + 1` })
       .where(and(eq(agentsTable.id, id), eq(agentsTable.ownerId, context.ownerId)))
       .returning();
     if (!row) throw new ORPCError("NOT_FOUND");
@@ -323,16 +331,21 @@ const get = owner.input(z.object({ id: z.string() })).handler(async ({ input, co
 const toolAsk = owner.input(z.object({ id: z.string() })).handler(async ({ input, context }) => {
   const agent = await find(context.db, context.ownerId, input.id);
   const rows = await context.db
-    .select({ toolId: toolsTable.id, name: toolsTable.name, actions: toolsTable.actions, unasked: agentTools.unasked, denied: agentTools.denied, disabled: toolsTable.disabled })
+    .select({ tool: toolsTable, unasked: agentTools.unasked, denied: agentTools.denied, strictTarget: agentTools.strictTarget })
     .from(agentTools)
     .innerJoin(toolsTable, eq(toolsTable.id, agentTools.toolId))
     .where(and(eq(agentTools.agentId, agent.id), eq(toolsTable.ownerId, context.ownerId), inArray(toolsTable.kind, ["http", "runner"])))
     .orderBy(asc(toolsTable.name));
-  return rows.map(({ toolId, name, actions, unasked, denied, disabled }) => ({
-    toolId,
-    name,
-    actions: enabledActions({ actions, disabled }).map((a) => ({ name: a.name, description: a.description, readOnly: a.readOnly === true, permission: (denied.includes(a.name) ? "off" : unasked.includes(a.name) ? "run" : "ask") as Permission })),
-  }));
+  // Shown as sessions get them: under strict permissions, a stale Run asks.
+  const strict = await strictTargets(context.db, context.ownerId, agent.id, rows.map((r) => r.tool), []);
+  return rows.map(({ tool, denied, ...row }) => {
+    const unasked = heldUnasked(strict, row, tool);
+    return {
+      toolId: tool.id,
+      name: tool.name,
+      actions: enabledActions(tool).map((a) => ({ name: a.name, description: a.description, readOnly: a.readOnly === true, permission: (denied.includes(a.name) ? "off" : unasked.includes(a.name) ? "run" : "ask") as Permission })),
+    };
+  });
 });
 
 /**

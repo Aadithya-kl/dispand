@@ -381,7 +381,30 @@ changes it updates this file.
   the agent (its `agent_tools` row takes over, starting with a remembered Off, and removing it
   later revives nothing); an agent
   save that keeps the package keeps them. The write locks the package and its `agent_skills` row. A tool pointed at another address or transport asks for everything
-  again on every agent for enabled actions: the unasked list named the old server's actions. Tools reached by URL and runner tools
+  again on every agent for enabled actions: the unasked list named the old server's actions.
+  That reset holds in both modes of the workspace's strict permissions (`workspace_settings.strict_permissions`,
+  off until the owner turns it on in Settings; no tool or proposal reads or sets it). Off, a remembered
+  choice (`agent_tools.unasked`, an `agent_skill_tool_permissions` row) is bound to the tool id and
+  its target only, as above. On, it is also bound to a strict target, written beside its lists and compared
+  only while strict is on, one rule for every reader (`heldUnasked`, `toolPermissionTarget` with versions
+  in `agents/tool-ask.ts`): the tool's target plus its listed actions' names and input and output
+  schemas, its plugin's commit, the skill package's files (`skill_packages.fingerprint`, for a choice
+  that came with a skill) and the agent's `revision` (raised by every `agents.update`). A choice whose
+  strict target differs, was written while strict was off, or can't be checked (the tool's last
+  listing failed) asks again; its Off stays (a stale Off asking would widen). An explicit change
+  under strict drops the stale grants of that tool rather than carrying them over. Turning strict on
+  makes choices remembered while it was off ask; turning it off keeps every choice. A Job is held to
+  the agent revision it was made from (its snapshot's), so a grant given after an edit doesn't reach
+  a Job still running the earlier configuration. Polls read only grants that still hold
+  (`tools/pollable.ts`). Turning strict on, and refreshing a tool's listing while it is on, narrows
+  running sessions, as skill edits and plugin updates already do. A future-run answer under strict
+  carries the strict target it was offered for (for a tool that comes with skills, each requiring
+  package's, its files included) and is refused when it is no longer current. An agent update
+  proposal freezes only the grants that still hold, each with the tool's strict target then (the
+  agent's own revision left out, since the approval itself changes it); on approval a list is
+  written only while that target is still current, otherwise a tool the agent had keeps its stale list (so it asks), and a tool it gains asks for
+  everything rather than taking its current defaults. A run's own
+  remembered decisions (`runs.remembered`) end with the run and carry no version. Tools reached by URL and runner tools
   have this list; runner tools use it in Job sessions only. The list changes in three ways, each a person's: the owner on the
   agent's page; an item of a proposal the owner approved (the write is a grant: an agent
   can list it, never make it on its own); and the answer "always allow" to an approval of
