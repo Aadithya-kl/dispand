@@ -68,13 +68,40 @@ test("deletions and asking flags read as what they do, with names; a value that 
   render(<ProposalItems proposal={more} />);
   const [table, field, flag] = screen.getAllByRole("listitem");
   expect(within(table!).getByText("Delete a table, with its rows")).toBeTruthy();
+  expect(within(table!).getByText("This can't be undone.")).toBeTruthy();
+  expect(within(flag!).queryByText("This can't be undone.")).toBeNull();
   expect(table!.textContent).toContain("Clients");
   expect(field!.textContent).toContain("Phone (of the table Clients)");
+  expect(within(field!).getByText("This can't be undone.")).toBeTruthy();
   expect(within(flag!).getByText("Set an action to Run, Ask, or Off")).toBeTruthy();
   expect(within(flag!).getByText(/tool_x: not one of yours/)).toBeTruthy();
   // The action happens to read like a table's id: it is shown as the text it is.
   expect(within(flag!).getByText("table_1")).toBeTruthy();
   expect(within(flag!).getByText("run")).toBeTruthy();
+});
+
+test("deleting an agent and changing a field's type say they can't be undone, with names, and no dry run row", () => {
+  const items: ProposalView = {
+    id: "prop_r",
+    status: "asked",
+    items: [
+      { tool: "agents_delete", used: false, refs: ["id"], input: { id: "agent_1" } },
+      { tool: "fields_retype", used: false, refs: ["id"], input: { id: "field_1", type: "number", dryRun: false } },
+    ],
+    names: { agent_1: { kind: "agent", name: "Clerk" }, field_1: { kind: "field", name: "Amount" } },
+  };
+  render(<ProposalItems proposal={items} />);
+  const [agent, field] = screen.getAllByRole("listitem");
+  expect(within(agent!).getByText("Delete an agent, with its triggers: its Jobs still going stop")).toBeTruthy();
+  expect(within(agent!).getByText("This can't be undone.")).toBeTruthy();
+  expect(agent!.textContent).toContain("Clerk");
+  expect(within(field!).getByText("Change a field's type: a value the new type can't hold is cleared")).toBeTruthy();
+  expect(within(field!).getByText("This can't be undone.")).toBeTruthy();
+  expect(within(field!).getByText("New type")).toBeTruthy();
+  expect(field!.textContent).toContain("Amount");
+  // The type by its name, as the Data screens show it.
+  expect(within(field!).getByText("Number")).toBeTruthy();
+  expect(field!.textContent).not.toMatch(/dryRun|Dry run/);
 });
 
 test("a trigger reads as what starts Jobs: its agent by name, its instructions and its schedule whole", () => {
@@ -296,6 +323,7 @@ test("a trigger's rate cap and concurrency read in words, and a field's choices 
   render(<ProposalItems proposal={setup} />);
   const [field, trigger] = screen.getAllByRole("listitem");
   expect(field!.textContent).toContain("ChoicesNew and Won");
+  expect(field!.textContent).toContain("TypeSingle select");
   expect(field!.textContent).not.toMatch(/c_new|"label"/);
   expect(trigger!.textContent).toContain("Jobs an hourAt most 30 an hour");
   expect(trigger!.textContent).toContain("Jobs at onceOne at a time");

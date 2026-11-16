@@ -3,6 +3,8 @@ import { Trans, useTranslation } from "react-i18next";
 import { useFormat } from "../../lib/format.ts";
 import { useText } from "../../lib/message.ts";
 import { PluginInstallItem } from "./PluginInstallItem.tsx";
+import { useFieldTypeLabel } from "../data/field-types.ts";
+import type { FieldType } from "@dispand/domain/data/fields";
 
 /** A proposal as the server gives it to its owner: every write, and a name for each id a write points at. */
 export type ProposalView = {
@@ -18,6 +20,9 @@ export type ProposalView = {
   /** The generated plugin ("Generated: <business name>") that records what the items create. */
   plugin?: string | null;
 };
+
+/** The writes that can't be undone: their item says so. */
+const IRREVERSIBLE = new Set(["tables_delete", "fields_delete", "fields_retype", "tools_delete", "agents_delete"]);
 
 /** The text of `key` in the questions namespace when there is one (an unknown tool or field shows as it is named). */
 function useWord() {
@@ -206,6 +211,7 @@ export function ProposalItems({ proposal }: { proposal: ProposalView }) {
   const { t } = useTranslation("questions");
   const word = useWord();
   const format = useFormat();
+  const fieldType = useFieldTypeLabel();
   return (
     <>
       {proposal.plugin && (
@@ -221,11 +227,12 @@ export function ProposalItems({ proposal }: { proposal: ProposalView }) {
             {word(`proposal.titles.${item.tool}`, item.tool)}
             {item.used && <span className={`ml-2 text-[12px] font-normal ${item.failed ? "text-danger" : "text-faint"}`}>{item.failed ? t("proposal.refused") : t("proposal.done")}</span>}
           </p>
+          {IRREVERSIBLE.has(item.tool) && <p className="mt-1 text-[13px] font-medium text-danger">{t("proposal.undone")}</p>}
           {item.tool === "plugins_install" ? (
             <PluginInstallItem input={item.input as never} shown={item.shown as never} />
           ) : (
           <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1.5 text-[13px]">
-            {Object.entries((item.input ?? {}) as Record<string, unknown>).filter(([name]) => !(item.tools && name === "toolPermissions")).map(([name, value]) => (
+            {Object.entries((item.input ?? {}) as Record<string, unknown>).filter(([name]) => !(item.tools && name === "toolPermissions") && !(item.tool === "fields_retype" && name === "dryRun")).map(([name, value]) => (
               <div key={name} className="contents">
                 <dt className="text-muted">{word(`proposal.labelsOf.${item.tool}.${name}`, word(`proposal.labels.${name}`, name))}</dt>
                 <dd className="min-w-0">
@@ -243,6 +250,8 @@ export function ProposalItems({ proposal }: { proposal: ProposalView }) {
                     <Consults value={value} items={proposal.items} names={proposal.names} />
                   ) : item.tool.startsWith("agents_") && name === "selfLearning" ? (
                     <Targets value={value} />
+                  ) : item.tool.startsWith("fields_") && name === "type" && typeof value === "string" ? (
+                    <span>{fieldType(value as FieldType)}</span>
                   ) : (
                     <Value
                       name={name}
