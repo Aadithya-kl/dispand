@@ -97,24 +97,28 @@ function Consult({ payload, onAnswer, busy }: Part<Extract<QuestionPayload, { ki
 }
 
 /** What a checkpoint's Approval says (`engine/roots.ts`): the root cause, its Jobs, the agents involved and since when. */
-export type CheckpointInput = { root: string | null; jobs: number; agents: string[]; since: string };
+export type CheckpointInput = { rootKind: string | null; jobs: number; agents: string[]; since: string };
 
 export function checkpointInput(payload: QuestionPayload): CheckpointInput {
   const input = (payload.kind === "permission" ? payload.input : null) as Partial<CheckpointInput> | null;
   return {
-    root: typeof input?.root === "string" ? input.root : null,
+    rootKind: typeof input?.rootKind === "string" ? input.rootKind : null,
     jobs: typeof input?.jobs === "number" ? input.jobs : 0,
     agents: Array.isArray(input?.agents) ? input.agents.filter((a): a is string => typeof a === "string") : [],
     since: typeof input?.since === "string" ? input.since : "",
   };
 }
 
+/** The root kinds the server names (`RootKind`): each has its own sentence; any other kind reads as the generic one. */
+const ROOT_KINDS = ["user", "chat", "schedule", "event", "poll"];
+export const checkpointKind = (c: CheckpointInput) => (c.rootKind && ROOT_KINDS.includes(c.rootKind) ? c.rootKind : "other");
+
 /** A checkpoint (design 6.1): the work from one root cause made this many Jobs; go on, go on for good, or stop it. */
 function Checkpoint({ payload, onAnswer, busy }: Part<Extract<QuestionPayload, { kind: "permission" }>>) {
   const { t } = useTranslation("questions");
   const format = useFormat();
   const c = checkpointInput(payload);
-  const root = c.root ?? t("checkpoint.defaultRoot");
+  const kind = checkpointKind(c);
   const send = (decision: "allow" | "allow-always" | "deny") => onAnswer({ kind: "permission", decision });
   const date = c.since ? new Date(c.since) : null;
   return (
@@ -122,9 +126,9 @@ function Checkpoint({ payload, onAnswer, busy }: Part<Extract<QuestionPayload, {
       <p className="text-[15px]">
         <Trans
           t={t}
-          i18nKey={date && !Number.isNaN(date.getTime()) ? "checkpoint.textSince" : "checkpoint.text"}
+          i18nKey={`checkpoint.${date && !Number.isNaN(date.getTime()) ? "textSince" : "text"}.${kind}` as "checkpoint.text.other"}
           count={c.jobs}
-          values={{ root, since: date ? format.dateTime(date) : "" }}
+          values={{ since: date ? format.dateTime(date) : "" }}
           components={[<span className="font-medium" />]}
         />
       </p>
