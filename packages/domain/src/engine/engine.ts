@@ -73,10 +73,11 @@ import { pollProblem } from "../tools/pollable.ts";
 import { give, next, take } from "./slots.ts";
 import { checkpointOf, newRoot, pause, pausedGauge, ROOT_STOPPED, rootGoing } from "./roots.ts";
 import { recordInteraction, recordInteractions } from "./interactions.ts";
+import { recordJobEvent } from "./jobs-events.ts";
 import { recordAudit, recordAuditAfter } from "../audit/record.ts";
 import type { AuditActor } from "../audit/model.ts";
 import { jobScope, startable } from "../questions/inbox-scope.ts";
-import { INTERACTION } from "../triggers/model.ts";
+import { INTERACTION, JOB } from "../triggers/model.ts";
 import { type Message, message } from "../messages/index.ts";
 
 type RunRow = typeof runs.$inferSelect;
@@ -598,6 +599,7 @@ export class Engine {
       spanId: span?.spanId ?? null,
     });
     counts.counter("dispand.runs.created").add(1, { "dispand.run.source": "agent", "dispand.run.trigger": firing.type });
+    await recordJobEvent(tx, { id: runId, ownerId, agentId, triggerId: triggerId ?? null, cause, status: "running", rootId }, "created");
     const creator = creatorOf(ownerId, cause);
     // In the Job's trace, which is a new one when nothing was traced around its creation (a recovery).
     await inJobTrace(span ?? {}, () => recordAudit(tx, {
@@ -642,6 +644,9 @@ export class Engine {
   async stopRun(runId: string): Promise<void> {
     const out: Out[] = [];
     const sessions = await this.db.transaction(async (tx) => {
+      // The root before the run, the order the paths that lock a root `FOR UPDATE` take them in (a chat, a consult): the run's end event references the root.
+      const [rooted] = await tx.select({ rootId: runs.rootId }).from(runs).where(eq(runs.id, runId));
+      if (rooted?.rootId) await tx.select({ id: roots.id }).from(roots).where(eq(roots.id, rooted.rootId)).for("key share");
       const [run] = await tx.select({ status: runs.status }).from(runs).where(eq(runs.id, runId)).for("update");
       if (!run) throw new EngineError("NOT_FOUND", "Run not found");
       if (!ACTIVE_RUN.includes(run.status)) throw new EngineError("CLOSED", "This run is over");
@@ -1231,7 +1236,8 @@ export class Engine {
     const decision = answer.kind === "permission" ? answer.decision : "deny";
     const answered = decision === "allow-always" ? "dont-ask" : decision === "allow" ? "approve" : "decline";
     counts.counter("dispand.checkpoints.answered").add(1, { "dispand.checkpoint.answer": answered });
-    const [root] = await tx.select().from(roots).where(eq(roots.id, rootId)).for("update");
+    // `NO KEY UPDATE`: a Job ending meanwhile (its run locked) still writes events referencing the root, so the decline's wait on its runs can't deadlock with it.
+    const [root] = await tx.select().from(roots).where(eq(roots.id, rootId)).for("no key update");
     if (!root || root.state !== "paused") return {};
     // The root's row, besides its Approval's `question.answered`: on a decline, with what it stopped.
     const audited = (details: { events?: number; jobs?: number } = {}) =>
@@ -2308,7 +2314,7 @@ export class Engine {
     return true;
   }
 
-  /** Why the run, a Job fired by a row's change, a Question or a poll's item, may no longer be told of it; null when it may. */
+  /** Why the run, a Job fired by a row's change, a Question or a poll's item, may no longer be told of it; null when it may (always, for another Job's event). */
   private async lostScope(runId: string): Promise<string | null> {
     const [row] = await this.db
       .select({ ownerId: runs.ownerId, agentId: runs.agentId, trigger: runs.trigger, bundles: agents.bundles, dataTables: agents.dataTables })
@@ -2321,6 +2327,8 @@ export class Engine {
     }
     if (row?.trigger.type !== "event") return null;
     const tableId = row.trigger.outputs.table_id ?? "";
+    // Another Job's ids and status: any agent may be told of them, so nothing is lost.
+    if (tableId === JOB) return null;
     // A Question or an Approval: still one its Job may read, with the Job's rights as they are now (and, once asked, still open).
     if (tableId === INTERACTION) {
       const scope = row.agentId ? await jobScope(this.db, { runId, ownerId: row.ownerId, agentId: row.agentId }) : null;
@@ -2488,6 +2496,7 @@ export class Engine {
       counts.counter("dispand.runs.finished").add(1, attributes);
       counts.histogram("dispand.run.duration", { unit: "ms", description: "From a run's creation to its end" }).record(row.finishedAt!.getTime() - row.createdAt.getTime(), attributes);
       if (row.source === "agent") {
+        await recordJobEvent(tx, row, status === "succeeded" ? "finished" : "failed");
         await inJobTrace(row, () => recordAudit(tx, {
           ownerId: row.ownerId,
           actor: { type: "job", runId: row.id },
