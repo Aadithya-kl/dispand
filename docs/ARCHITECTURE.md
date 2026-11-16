@@ -1711,7 +1711,46 @@ for the owner in the update's Approval, in the Inbox, which the page links to (`
 the Job ended) and where each value is accepted or declined (`plugins.resolveConflict`,
 `answerConflict`, with the same check); or it is theirs again, with the three choices of the update's screen (keep
 theirs, take the plugin's, or hand it to Stem once more against the values as they are now). Not
-yet built: tables' and skill files' conflicts.
+yet built: skill files' conflicts.
+
+A plugin's table can be handed to Stem too, whole: on the update's screen its "Let Stem deal with
+it" box leaves its change boxes to Stem (`stem` takes `table:<id>`, refused with ticks for that
+table). The update applies nothing of it and leaves its `definition` as it was merged, and
+`handToStem` keeps one conflict for it (`kind: "table"`, field `changes`, no migration: `kind` is
+plain text): `old` the definition it was merged with, `mine` its fields then, `next` the plugin's
+definition with the changes shown. The Job is given each change by key with its kind, field,
+whether it applies and how many rows would lose values, never a row's value. `plugin_decide`
+takes a list of keys (a reset: every applicable one); any key the screen didn't show as
+applicable refuses the whole decision, which applies nothing. `decideTable` plans the table again
+(`plugins/table-apply.ts`, shared with the update and the plugin row's Apply) from the
+definition it keeps to the plugin's current one, which must still be the two the conflict holds
+(else an update merged it again and the conflict is gone); a key whose change is stale by now is
+skipped. A change that removes values (a field removed or retyped, choices dropped), whatever the
+row count, waits in the update's Approval with its field's values (`merged`: how many rows hold
+one, the first 50 with their row ids to show, a digest of all); the rest apply now through the
+field operations, and one an operation refuses (the field limit, say) is in `plugin_decide`'s
+result (`refused`, by key and reason) and stays offered. The definition the table keeps takes
+what Stem decided and declined, but keeps what waits or was refused as it was. What Stem leaves
+out counts as declined, as an unticked box. The Approval's answer (`answerTable`) is one
+transaction with the table locked `for update`, the lock every field operation takes and a row's
+write takes `for share`, so nothing lands in between: it plans the changes again against the
+definition the table keeps (an update that merged it since leaves nothing), claims the item
+(deleted only while still in `approval` with the `merged` the owner answered on), and on a yes
+reads the values again (another digest stores the values now, rolls the claim back and asks
+again, CONFLICT), then runs each change's field operation in that transaction (`removeFieldIn`,
+`retypeIn`, `updateFieldIn`, the bodies `fields.delete`, `fields.retype` and `fields.update` run
+under their own lock), each in a savepoint. A change that went stale meanwhile (the field retyped
+or its choices edited since) is skipped and declined; one its operation refuses stays out of the
+definition, offered again; both are in `resolveConflict`'s answer (`stale`, `refused`), which the
+Inbox item says. A no declines the Approval's changes as an unticked box; the plugin's row still
+offers each with Apply. Either way only the Approval's changes are answered (one that failed
+earlier stays offered). The values shown are the field's as they are: a choice change or a
+retype may keep some. A table conflict is never `open`: when the Job ends without deciding it
+(`closeStemJob`), it is dropped, and since the definition still lacks its changes, the next update
+offers them again as the checklist, with their loss as it is then. Every update that plans a
+table drops its pending conflict (`forgetConflicts`), so an old decision never applies onto a
+table merged since. The element pages have no Stem mark for tables: the update's Approval is
+where a table's decision waits.
 
 Native support currently requires `plugins.native_root = '.'`, recorded from the resolved Git
 checkout when importing or updating. Legacy rows have null until updated. Nested imports are

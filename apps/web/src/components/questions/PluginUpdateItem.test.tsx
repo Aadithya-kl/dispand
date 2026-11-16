@@ -2,6 +2,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 
 const fake = vi.hoisted(() => ({ questions: { list: vi.fn(), answer: vi.fn() }, plugins: { resolveConflict: vi.fn() }, agents: {}, tools: {}, triggers: {} }));
@@ -41,10 +42,16 @@ const item = (status: string, items: unknown[], answer: unknown = null) => ({
 
 const entry = (id: string, name: string, field: string, merged: string) => ({ id, kind: "agent", elementId: "agent_1", name, field, status: "approval", mine: "Mine", next: "Next", merged, reviewed: `r_${id}` });
 
+/** The Inbox keeps what an answer couldn't make, by question; here, one item's. */
+function Kept({ value }: { value: unknown }) {
+  const [notices, setNotices] = useState<string[]>([]);
+  return <InboxItem item={value as never} notices={notices} onNotices={(said) => setNotices((prev) => [...prev, ...said])} />;
+}
+
 function mount(value: unknown) {
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <InboxItem item={value as never} />
+      <Kept value={value} />
     </QueryClientProvider>,
   );
 }
@@ -72,4 +79,20 @@ test("a refused answer says why; once done, the item says which update it was fo
   mount(item("answered", [], { kind: "permission", decision: "allow" }));
   expect(screen.getByText("Stem merged values for the update of law-firm.")).toBeTruthy();
   expect(screen.getByText("You answered each value.")).toBeTruthy();
+});
+
+test("a table's item shows each change Stem picked that removes values, with the values it removes, as plain text", async () => {
+  fake.plugins.resolveConflict.mockResolvedValue({ ok: true, refused: [{ key: "remove:Conclusions", reason: { text: "It is the parent." } }] });
+  const table = { id: "c3", kind: "table", elementId: "tbl_1", name: "Matters", field: "changes", status: "approval", mine: [], next: { definition: {}, changes: [{ key: "add:Fee", kind: "add", field: "Fee", ticked: true }, { key: "remove:Conclusions", kind: "remove", field: "Conclusions", ticked: false, loses: 1 }] }, merged: { keys: ["remove:Conclusions"], values: { "remove:Conclusions": { count: 51, shown: [["row_1", "<b>Settled.</b>"]], digest: "d" } } }, reviewed: "r_c3" };
+  mount(item("pending", [table]));
+  const li = screen.getByRole("listitem", { name: "Matters: Changes" });
+  expect(within(li).getByText("Remove the field Conclusions")).toBeTruthy();
+  expect(within(li).queryByText(/Add the field Fee/)).toBeNull();
+  expect(within(li).getByText(/the field holds these now, in 51 rows/)).toBeTruthy();
+  expect(within(li).getByText("And 50 more rows.")).toBeTruthy();
+  expect(within(li).getByText("<b>Settled.</b>")).toBeTruthy();
+  await userEvent.click(within(li).getByRole("button", { name: "Accept Stem's" }));
+  expect(fake.plugins.resolveConflict).toHaveBeenCalledWith(expect.objectContaining({ id: "c3", choice: "accept", reviewed: "r_c3" }), expect.anything());
+  // What wasn't made is said, by the Inbox item.
+  expect(await screen.findByText(/“Remove the field Conclusions” wasn’t made: It is the parent\. The plugin’s next update offers it again\./)).toBeTruthy();
 });

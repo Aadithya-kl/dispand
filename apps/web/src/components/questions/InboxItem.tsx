@@ -58,7 +58,7 @@ function useInboxText() {
 }
 
 /** One Question or Approval of the Inbox: answerable while it waits, then shown with its answer, who gave it and when. */
-export function InboxItem({ item }: { item: InboxEntry }) {
+export function InboxItem({ item, notices = [], onNotices }: { item: InboxEntry; /** What an answer to a plugin update's item couldn't make: kept by the Inbox, since this item moves to Done once answered. */ notices?: string[]; onNotices?: (notices: string[]) => void }) {
   const { t } = useTranslation("questions");
   const { t: tm } = useTranslation("messages");
   const format = useFormat();
@@ -115,7 +115,7 @@ export function InboxItem({ item }: { item: InboxEntry }) {
           {t("answeredElsewhere")}
         </p>
       ) : open && item.update ? (
-        <PluginUpdateItem update={item.update} />
+        <PluginUpdateItem update={item.update} onNotices={onNotices} />
       ) : open ? (
         <QuestionForm question={item} busy={answer.isPending} error={answer.error?.message ?? null} onAnswer={(a) => answer.mutate({ questionId: item.id, answer: a })} />
       ) : (
@@ -144,6 +144,11 @@ export function InboxItem({ item }: { item: InboxEntry }) {
           )}
         </div>
       )}
+      {notices.map((n) => (
+        <p key={n} role="status" className="text-[13px] text-danger">
+          {n}
+        </p>
+      ))}
     </article>
   );
 }
