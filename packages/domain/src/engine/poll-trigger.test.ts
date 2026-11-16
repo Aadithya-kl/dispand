@@ -12,6 +12,7 @@ import type { TriggerConfig } from "../triggers/model.ts";
 import { Engine } from "./engine.ts";
 import type { Harness, HarnessAdapter, StartParams } from "./harness.ts";
 import { MAX_WALK_PAGES, Scheduler, SCHEDULER_TICK_MS } from "./scheduler.ts";
+import { stored, storedText } from "../messages/index.ts";
 
 class FakeAdapter implements HarnessAdapter {
   starts: { harness: Harness; start: StartParams }[] = [];
@@ -87,11 +88,12 @@ async function setup() {
   const runnerCalls: unknown[] = [];
   // A runner whose `mail` server answers like the fake one, refusing a call while one to the same tool is under way, as runners do.
   const calling = new Set<string>();
-  const during: { call?: () => Promise<unknown>; hasMore?: boolean } = {};
+  const during: { call?: () => Promise<unknown>; hasMore?: boolean; error?: string } = {};
   const hub: Pick<RunnerHub, "call"> = {
     call: async (_runnerId, msg) => {
       runnerCalls.push(msg);
       await during.call?.();
+      if (during.error !== undefined) return { type: "tool.called", requestId: msg.requestId, error: during.error };
       const tool = JSON.stringify(msg.tool);
       if (calling.has(tool)) return { type: "tool.called", requestId: msg.requestId, error: "busy" };
       calling.add(tool);
@@ -222,7 +224,7 @@ test("a poll whose action an owner unticked, or an agent must now ask before usi
   s.time.add(5 * MINUTE);
   expect(await scheduler.tick()).toEqual([]);
   expect(s.calls).toHaveLength(1);
-  expect((await s.pollsOf(trigger.id)).at(-1)).toMatchObject({ status: "skipped", message: expect.stringContaining("A poll may not read this action") });
+  expect((await s.pollsOf(trigger.id)).at(-1)).toMatchObject({ status: "skipped", message: stored("tools.poll.notReadable") });
 
   await call(router.tools.setPollable, { id: s.tool.id, actions: ["list_mail"] }, { context: s.context });
   await call(router.agents.setToolPermission, { agentId: s.clerk.id, toolId: s.tool.id, action: "list_mail", permission: "ask" }, { context: s.context });
@@ -231,7 +233,7 @@ test("a poll whose action an owner unticked, or an agent must now ask before usi
   expect(await scheduler.tick()).toEqual([]);
   expect(s.calls).toHaveLength(1);
   const view = await call(router.triggers.get, { id: trigger.id }, { context: s.context });
-  expect(view.lastPolls[0]).toMatchObject({ status: "skipped", message: expect.stringContaining("an agent must ask before using it") });
+  expect(view.lastPolls[0]).toMatchObject({ status: "skipped", message: stored("tools.poll.notReadable") });
 });
 
 test("two schedulers due on one poll call it once", async () => {
@@ -325,7 +327,7 @@ test("a result without the list fails the poll with a reason, and records nothin
   const s = await setup();
   const trigger = await s.watch({ itemsPath: "items" });
   await s.scheduler().tick();
-  expect(await s.pollsOf(trigger.id)).toMatchObject([{ status: "failed", message: "The result has no list at “items”" }]);
+  expect(await s.pollsOf(trigger.id)).toMatchObject([{ status: "failed", message: stored("tools.poll.noList", { path: "items" }) }]);
   // Still the baseline to come: the next poll that works records only.
   await call(router.triggers.update, { id: trigger.id, config: { ...(trigger.config as Extract<TriggerConfig, { kind: "poll" }>), itemsPath: "value" } }, { context: s.context });
   s.mailbox.push({ id: "m1", subject: "Hello" });
@@ -345,7 +347,7 @@ test("an agent that loses the tool between dispatch and session start never gets
   await s.engine.continueRun(runId!);
   await vi.waitFor(async () => {
     const [run] = await s.context.db.select().from(runs).where(eq(runs.id, runId!));
-    expect(run).toMatchObject({ status: "failed", error: "The agent may no longer read the tool's action that found this item" });
+    expect(run).toMatchObject({ status: "failed", error: stored("engine.fail.scope.poll") });
   });
   expect(s.adapter.starts).toEqual([]);
 });
@@ -360,7 +362,7 @@ test("items waiting under a trigger's old source are refused when it reads somet
   expect(await scheduler.tick()).toHaveLength(1);
   const config = trigger.config as Extract<TriggerConfig, { kind: "poll" }>;
   await call(router.triggers.update, { id: trigger.id, config: { ...config, arguments: { top: 1 } } }, { context: s.context });
-  expect((await s.itemsOf(trigger.id)).find((i) => i.itemId === "m2")).toMatchObject({ status: "refused", message: "The trigger was changed: it reads something else now" });
+  expect((await s.itemsOf(trigger.id)).find((i) => i.itemId === "m2")).toMatchObject({ status: "refused", message: stored("engine.fire.changed") });
   s.time.add(61 * MINUTE);
   await scheduler.tick();
   expect(await s.jobsOf(trigger.id)).toHaveLength(1);
@@ -405,6 +407,17 @@ test("a poll waiting for another of its runner's tool is checked again before it
   expect(s.runnerCalls).toHaveLength(1);
   const statuses = [...(await s.pollsOf(a.id)), ...(await s.pollsOf(b.id))].map((p) => p.status).sort();
   expect(statuses).toEqual(["baseline", "skipped"]);
+});
+
+test("a runner's error text shaped like a stored message is recorded as its words, never read as one", async () => {
+  const s = await setup();
+  await onRunner(s);
+  const trigger = await s.watch({ toolId: "tool_runner_mail", action: "list-mail-messages", arguments: { top: 10 } });
+  s.during.error = '{"key":"engine.fail.stopped"}';
+  await s.scheduler().tick();
+  const [poll] = await s.pollsOf(trigger.id);
+  expect(poll).toMatchObject({ status: "failed" });
+  expect(storedText(poll!.message!)).toEqual({ text: '{"key":"engine.fail.stopped"}' });
 });
 
 test("saving a poll trigger as it is, its arguments' keys in another order, keeps its waiting items", async () => {
@@ -510,7 +523,7 @@ test("a server returning next links forever is read 20 pages a poll; the walk go
   await scheduler.tick();
   expect(s.calls).toHaveLength(MAX_WALK_PAGES);
   const view = await call(router.triggers.get, { id: trigger.id }, { context: s.context });
-  expect(view.lastPolls[0]).toMatchObject({ status: "baseline", message: "20 pages read: the rest at the next poll" });
+  expect(view.lastPolls[0]).toMatchObject({ status: "baseline", message: stored("engine.poll.pages", { pages: 20 }) });
   // Not at once: at the next interval, from where it stopped.
   s.time.add(SCHEDULER_TICK_MS);
   await scheduler.tick();

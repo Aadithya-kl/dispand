@@ -14,6 +14,7 @@ import { CatalogSettings } from "./CatalogSettings.tsx";
 import { ToolSignIn } from "./ToolSignIn.tsx";
 import { Overridden } from "./Overridden.tsx";
 import { StemMarks } from "./StemMarks.tsx";
+import { useStored } from "@/lib/message";
 
 export type Tool = Awaited<ReturnType<typeof api.tools.list>>[number];
 type Action = Tool["actions"][number];
@@ -42,6 +43,7 @@ export function errorMessage(e: unknown, fallback: string): string {
 /** "Add MCP server", or the editor of a tool with its actions. Mount it only while open. */
 export function ToolSheet({ tool, onClose, onSaved }: Props) {
   const { t } = useTranslation("tools");
+  const stored = useStored();
   const fieldLabels = t("sheet.field", { returnObjects: true });
   const [name, setName] = useState(tool?.name ?? "");
   const [url, setUrl] = useState(tool?.url ?? "");
@@ -131,7 +133,7 @@ export function ToolSheet({ tool, onClose, onSaved }: Props) {
       const message = errorMessage(e, t("sheet.connectFailed"));
       setError(message);
       // The server's authorization server wants a client id it gave the owner: its fields open.
-      if (/enter the client id/.test(message)) setAskClient(true);
+      if (["tools.fail.needsClient", "tools.fail.otherAuthServer"].includes((e as { data?: { key?: string } }).data?.key ?? "")) setAskClient(true);
     }
   }
 
@@ -321,7 +323,7 @@ export function ToolSheet({ tool, onClose, onSaved }: Props) {
               </div>
               {current.actionsError && (
                 <p role="status" className="text-[13px] text-danger">
-                  {current.actionsError}
+                  {stored(current.actionsError)}
                 </p>
               )}
               <p className="text-[13px] text-muted">{t("sheet.actionsNote")}</p>
