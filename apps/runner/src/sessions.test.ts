@@ -523,16 +523,24 @@ test("a start with a Job token gives the CLI the Job server at the runner's own 
   expect(Object.keys(fake.servers[1] ?? {})).not.toContain("job");
 });
 
-test("a restricted start gets the Job's own server alone, whatever MCP servers or memory it holds; on Codex it is refused", async () => {
+test("a restricted start gets the Job's own server alone, whatever MCP servers or memory it holds, on Claude Code and on Codex", async () => {
   const { events, fake, sessions } = await setup();
   const files = [{ scope: "agent" as const, path: "MEMORY.md", text: "# This agent\n" }];
   await sessions.handle({ type: "session.start", start: { ...start("ses_1", "run_a"), jobToken: "dj_token", restricted: true, memory: files, mcpServers: [{ name: "mail", type: "runner" as const, tool: "gmail", unasked: ["draft_email"] }] } });
   await ended(events, "ses_1");
   // The Job's own server and the session's answer tool: no runner tool, no Job tools server.
   expect(Object.keys(fake.servers[0] ?? {})).toEqual(["job", "dispand"]);
-  const { events: codexEvents, sessions: codexSessions, codexStart } = await codexSetup("0.166.0", {});
-  await codexSessions.handle({ type: "session.start", start: { ...codexStart("ses_2", "run_b"), jobToken: "dj_token", restricted: true } });
-  await waitFor(() => expect(codexEvents).toContainEqual(["ses_2", { type: "error", message: "A restricted session runs on Claude Code only" }]));
+  const { codex, events: codexEvents, sessions: codexSessions, codexStart } = await codexSetup("0.167.0", {});
+  await codexSessions.handle({ type: "session.start", start: { ...codexStart("ses_2", "run_b"), jobToken: "dj_token", restricted: true, memory: files, mcpServers: [{ name: "mail", type: "runner" as const, tool: "gmail", unasked: ["draft_email"] }] } });
+  await ended(codexEvents, "ses_2");
+  const thread = (await codex.received()).find((m) => m.method === "thread/start")!;
+  expect(Object.keys((thread.params as { config: { mcp_servers: object } }).config.mcp_servers)).toEqual(["job"]);
+  expect(codexEvents.filter(([, e]) => e.type === "error")).toEqual([]);
+  // On a Codex older than the one its switches were checked on, it is refused before anything starts.
+  const old = await codexSetup("0.166.0", {});
+  await old.sessions.handle({ type: "session.start", start: { ...old.codexStart("ses_3", "run_c"), jobToken: "dj_token", restricted: true } });
+  expect(old.events).toEqual([["ses_3", { type: "error", message: "A restricted session needs Codex ≥ 0.167.0 (found 0.166.0): update codex on this machine" }]]);
+  expect((await old.codex.received()).some((m) => m.method === "thread/start")).toBe(false);
 });
 
 test("a consult waits across a reconnection to Dispand, and its answer then reaches the session's tool call", async () => {

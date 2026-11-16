@@ -12,7 +12,7 @@
 - **Runners:** `runners.create` (owner) makes a runner and a single-use pairing code (8
   characters, 15 minutes); the runner trades it at `POST /runner/pair` (public) for a token
   (32 random bytes, stored as SHA-256). It then dials `/runner/ws` with
-  `Authorization: Bearer <token>` and `Dispand-Protocol: 28` (`PROTOCOL_VERSION`, bumped by
+  `Authorization: Bearer <token>` and `Dispand-Protocol: 29` (`PROTOCOL_VERSION`, bumped by
   every change an older runner can't parse or honor). An older runner is refused with 426 "update
   the runner" and its version recorded (`runners.protocol_version`; runners seen before protocol 2
   were set to 1 by migration 0009), so `runners.list` reports it `outdated` with the command that
@@ -1657,8 +1657,17 @@ start arguments: on Claude Code, no built-in tool (`tools: []`, and the CLI's se
 `advisor` switched off with `CLAUDE_CODE_DISABLE_ADVISOR_TOOL`, since neither `tools` nor
 `disallowedTools` removes it), no settings source,
 `strictMcpConfig`, no skill package, memory file or consult, and the Job's own `job` server
-alone; on Codex the start is refused (`startProblem` refuses it first), the Job fails and its
-conflicts are the owner's again. On the element's page (`StemMarks`, from
+alone; on Codex (`codex/config.ts` `RESTRICTED`, checked with 0.167.0), the same, with
+`submit_outputs` its only dynamic tool, every native tool a switch removes turned off through
+`features` and config keys, every MCP server of the user's config set `enabled = false` (their
+names from `config/read`), a read-only profile without network, and `environments: []` on every
+`turn/start`, so the `apply_patch` the model's catalog entry adds (no switch removes it) fails
+before touching a file. `codex/restricted-tools.test.ts` runs the machine's Codex against a
+stand-in Responses API and checks every tool the model is offered; the runner refuses a
+restricted Codex start below `RESTRICTED_CODEX` (0.167.0) and warns above it, until that test
+is run again on the new version (runner protocol 29: an older
+runner refuses restricted Codex starts and shows as outdated). A start that fails fails the Job,
+and its conflicts are the owner's again. On the element's page (`StemMarks`, from
 `plugins.conflicts`), each conflict says where it is: Stem is looking; Stem's merged value waits
 for the owner, who accepts it or keeps theirs (`plugins.resolveConflict`, `answerConflict`, with
 the same check); or it is theirs again, with the three choices of the update's screen (keep
