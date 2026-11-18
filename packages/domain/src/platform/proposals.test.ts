@@ -819,6 +819,7 @@ test("apply waits for an item another call is still making: what comes after it 
     .set({ items: row!.items.map((item, i) => (i === 0 ? { ...item, usedAt: new Date().toISOString(), pending: true as const } : item)) })
     .where(eq(proposals.id, id));
   const applied = (await s.tool("proposal_apply", { proposalId: id })) as Applied;
+  expect((await proposalView(s.context.db, s.context.ownerId, id))!.items[0]).toMatchObject({ pending: true });
   expect(applied.output.items.map((i) => i.outcome)).toEqual(["being made", "not made"]);
   expect(applied.output.next).toMatch(/^Item 1 \(tables_create\) is being made by another call/);
   expect(await s.context.db.select().from(tablesTable)).toHaveLength(0);
@@ -1143,4 +1144,14 @@ test("an agent update's view carries the fields it gives as they stand now, and 
   const view = await proposalView(s.context.db, s.context.ownerId, id);
   expect(view!.items[0]!.before).toMatchObject({ name: "Builder", harnessId: s.harness.id, systemPrompt: "", dataTables: "all" });
   expect(view!.names[s.harness.id]?.name).toBe("Claude");
+});
+
+test.each(["allow", "deny"] as const)("run snapshots retain proposal scope after %s", async decision => {
+  const s = await setup();
+  const input = { name: "Matters" };
+  const id = s.idOf(await s.propose([{ tool: "tables_create", input }]));
+  const questionId = await s.ask({ message: "Create Matters", proposal: id });
+  await s.answer(questionId, decision);
+  const run = await call(router.runs.get, { runId: s.job.runId }, { context: s.context });
+  expect(run.questions.find(q => q.id === questionId)?.proposal?.items[0]?.input).toEqual(input);
 });
