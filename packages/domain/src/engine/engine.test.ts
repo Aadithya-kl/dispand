@@ -31,6 +31,12 @@ class FakeAdapter implements HarnessAdapter {
   sent: [string, string][] = [];
   answers: [string, string, Answer][] = [];
   online = true;
+  interruptOutcome: "requested" | "stale" | "failed" = "requested";
+  interrupts: [string, string][] = [];
+  async interrupt(sessionId: string, turnId: string) {
+    this.interrupts.push([sessionId, turnId]);
+    return this.online ? this.interruptOutcome : "failed" as const;
+  }
   /** While set, starts don't settle until it does (a write still under way). */
   hold: Promise<void> | undefined;
   async start(harness: Harness, start: StartParams) {
@@ -54,6 +60,144 @@ class FakeAdapter implements HarnessAdapter {
     return this.online;
   }
 }
+
+test("Codex admits queued followups only after turn end and harness capacity", async () => {
+  const { context, adapter, engine, emit, workflow, harness, agent, runnerId } = await setup(chatThenStep);
+  await context.db.update(harnessesTable).set({ kind: "codex", permissionMode: "default", maxWorking: 1 }).where(eq(harnessesTable.id, harness.id));
+  const trigger = await call(router.triggers.create, { agentId: agent.id, name: "Chat", instructions: "Ask what to build.", config: { kind: "manual", placement: "chat" } }, { context });
+  const runId = await engine.startJob(trigger.id, context.ownerId);
+  const chat = async () => (await context.db.select().from(stepRuns).where(eq(stepRuns.runId, runId)))[0]!;
+  const queuedAudit = () => context.db.select().from(audit).where(and(eq(audit.jobId, runId), eq(audit.action, "job.queued")));
+  const session = adapter.starts[0]!.start.sessionId;
+  await engine.sendChat(runId, "First followup");
+  await engine.sendChat(runId, "Second followup");
+  expect(adapter.sent).toEqual([]);
+  await emit(session, { type: "turn-start", turnId: "initial", interruptible: true });
+  await emit(session, { type: "question", questionId: "approval", payload: { kind: "confirm-outputs", values: {} } });
+  const otherRun = await engine.startRun(workflow.id);
+  expect((await runOf(engine, otherRun)).steps.n_chat!.working).toBe(true);
+  vi.spyOn(adapter, "interrupt").mockImplementation(async () => {
+    await emit(session, { type: "turn-end", turnId: "initial" });
+    return "requested";
+  });
+  await engine.interruptChat(runId, "initial");
+  expect(adapter.sent).toEqual([]);
+  expect(await chat()).toMatchObject({ working: false, queueClass: "person", pendingAction: { kind: "deliver" } });
+  const queuedAt = (await chat()).queuedAt;
+  expect(await queuedAudit()).toHaveLength(1);
+  await engine.reconcile(runnerId, adapter.starts.map(({ start }) => start.sessionId));
+  expect((await chat()).queuedAt).toEqual(queuedAt);
+  expect(await queuedAudit()).toHaveLength(1);
+  await engine.stopRun(otherRun);
+  await vi.waitFor(() => expect(adapter.sent).toEqual([[session, "First followup"]]));
+  await engine.sendChat(runId, "Third followup");
+  expect(adapter.sent).toHaveLength(1);
+  await emit(session, { type: "turn-start", turnId: "next", interruptible: true });
+  await emit(session, { type: "turn-end", turnId: "next" });
+  await vi.waitFor(() => expect(adapter.sent).toEqual([[session, "First followup"], [session, "Second followup"]]));
+});
+
+test("Codex retries only its admitted input after an engine restart", async () => {
+  const { context, adapter, engine, emit, workflow, harness, runnerId } = await setup(chatThenStep);
+  await context.db.update(harnessesTable).set({ kind: "codex", permissionMode: "default", maxWorking: 1 }).where(eq(harnessesTable.id, harness.id));
+  const runId = await engine.startRun(workflow.id);
+  const session = adapter.starts[0]!.start.sessionId;
+  await emit(session, { type: "turn-start", turnId: "initial", interruptible: true });
+  await emit(session, { type: "turn-end", turnId: "initial" });
+  adapter.online = false;
+  await engine.sendChat(runId, "Retry me");
+  await vi.waitFor(() => expect(adapter.sent).toEqual([[session, "Retry me"]]));
+  await engine.sendChat(runId, "Later");
+  const restarted = new Engine(context.db, adapter);
+  onTestFinished(() => restarted.stop());
+  adapter.online = true;
+  await restarted.reconcile(runnerId, [session]);
+  await vi.waitFor(async () => {
+    const rows = await context.db.select().from(messages).where(eq(messages.runId, runId)).orderBy(messages.position);
+    expect(rows[0]!.deliveredAt).not.toBeNull();
+    expect(rows[1]!.deliveredAt).toBeNull();
+  });
+  await restarted.reconcile(runnerId, [session]);
+  expect(adapter.sent).toEqual([[session, "Retry me"], [session, "Retry me"]]);
+  await restarted.onHarnessEvent(session, { type: "turn-start", turnId: "retry", interruptible: true }, { runnerId, seq: 100 });
+  await restarted.onHarnessEvent(session, { type: "turn-end", turnId: "retry" }, { runnerId, seq: 101 });
+  await vi.waitFor(() => expect(adapter.sent.at(-1)).toEqual([session, "Later"]));
+  expect(adapter.sent).toHaveLength(3);
+});
+
+test("cloud continuation queue entry has person priority and one audit event", async () => {
+  const { context, adapter, engine, workflow, harness, agent } = await setup(chatThenStep);
+  await context.db.update(harnessesTable).set({ maxWorking: 1 }).where(eq(harnessesTable.id, harness.id));
+  const trigger = await call(router.triggers.create, { agentId: agent.id, name: "Chat", instructions: "Help.", config: { kind: "manual", placement: "chat" } }, { context });
+  const runId = await engine.startJob(trigger.id, context.ownerId);
+  const session = adapter.starts[0]!.start.sessionId;
+  await context.db.update(stepRuns).set({ runnerId: CLOUD_SOURCE }).where(eq(stepRuns.sessionId, session));
+  const queuedAudit = () => context.db.select().from(audit).where(and(eq(audit.jobId, runId), eq(audit.action, "job.queued")));
+  expect(await engine.claimCloudTurn(session)).toBe(true);
+  expect(await queuedAudit()).toHaveLength(0);
+  await engine.onHarnessEvent(session, { type: "turn-start", turnId: "first", interruptible: true }, { runnerId: CLOUD_SOURCE, seq: 1 });
+  await engine.onHarnessEvent(session, { type: "turn-end", turnId: "first" }, { runnerId: CLOUD_SOURCE, seq: 2 });
+  await engine.startRun(workflow.id);
+  expect(await engine.claimCloudTurn(session)).toBe(false);
+  expect(await Promise.all([engine.claimCloudTurn(session), engine.claimCloudTurn(session)])).toEqual([false, false]);
+  const [step] = await context.db.select().from(stepRuns).where(eq(stepRuns.runId, runId));
+  expect(step).toMatchObject({ queueClass: "person", working: false, pendingAction: { kind: "deliver" } });
+  expect(await queuedAudit()).toHaveLength(1);
+});
+
+test("Codex admits a resumed question's answer before queued chat messages", async () => {
+  const { context, adapter, engine, emit, workflow, harness, runnerId } = await setup(chatThenStep);
+  await context.db.update(harnessesTable).set({ kind: "codex", permissionMode: "default", maxWorking: 1 }).where(eq(harnessesTable.id, harness.id));
+  const runId = await engine.startRun(workflow.id);
+  const session = adapter.starts[0]!.start.sessionId;
+  await emit(session, { type: "cli-session", cliSessionId: "cli_saved" });
+  await emit(session, { type: "turn-start", turnId: "initial", interruptible: true });
+  await emit(session, { type: "question", questionId: "approval", payload: { kind: "confirm-outputs", values: {} } });
+  await engine.reconcile(runnerId, []);
+  const [question] = await context.db.select().from(questions).where(eq(questions.runId, runId));
+  await engine.answer(question!.id, { kind: "confirm-outputs", confirmed: false });
+  await engine.sendChat(runId, "Next input");
+  expect(adapter.sent).toEqual([]);
+  await emit(session, { type: "turn-start", turnId: "resumed", interruptible: true });
+  await emit(session, { type: "turn-end", turnId: "resumed" });
+  await vi.waitFor(() => expect(adapter.sent).toEqual([[session, "The owner did not confirm your values."]]));
+  await emit(session, { type: "turn-start", turnId: "answer", interruptible: true });
+  await emit(session, { type: "turn-end", turnId: "answer" });
+  await vi.waitFor(() => expect(adapter.sent.at(-1)).toEqual([session, "Next input"]));
+});
+
+test("Codex lost-session resume preserves attachment order and does not repeat a completed input", async () => {
+  const { context, adapter, engine, emit, workflow, harness, runnerId } = await setup(chatThenStep);
+  await context.db.update(harnessesTable).set({ kind: "codex", permissionMode: "default", maxWorking: 1 }).where(eq(harnessesTable.id, harness.id));
+  const send = vi.spyOn(adapter, "send");
+  const runId = await engine.startRun(workflow.id);
+  const session = adapter.starts[0]!.start.sessionId;
+  await emit(session, { type: "cli-session", cliSessionId: "cli_saved" });
+  await emit(session, { type: "turn-start", turnId: "initial", interruptible: true });
+  await emit(session, { type: "turn-end", turnId: "initial" });
+  await engine.sendChat(runId, "Completed input");
+  await vi.waitFor(() => expect(adapter.sent).toHaveLength(1));
+  await emit(session, { type: "turn-start", turnId: "completed", interruptible: true });
+  await engine.sendChat(runId, "File input");
+  const files = [{ id: "att_saved", name: "notes.txt" }];
+  await context.db.update(messages).set({ files }).where(and(eq(messages.runId, runId), eq(messages.text, "File input")));
+  await engine.sendChat(runId, "After file");
+  // The completed input is acknowledged, while queued inputs survive a lost session.
+  await emit(session, { type: "turn-end", turnId: "completed" });
+  await vi.waitFor(() => expect(send).toHaveBeenLastCalledWith(session, "File input", files));
+  await engine.reconcile(runnerId, []);
+  await vi.waitFor(() => expect(adapter.starts).toHaveLength(2));
+  expect(adapter.starts[1]!.start.prompt).not.toContain("Completed input");
+  expect(adapter.starts[1]!.start.prompt).not.toContain("After file");
+  expect(adapter.sent).toHaveLength(2);
+  await emit(session, { type: "turn-start", turnId: "resumed", interruptible: true });
+  await emit(session, { type: "turn-end", turnId: "resumed" });
+  await vi.waitFor(() => expect(send).toHaveBeenLastCalledWith(session, "File input", files));
+  await vi.waitFor(() => expect(adapter.sent).toHaveLength(3));
+  await emit(session, { type: "turn-start", turnId: "file", interruptible: true });
+  await emit(session, { type: "turn-end", turnId: "file" });
+  await vi.waitFor(() => expect(adapter.sent.at(-1)).toEqual([session, "After file"]));
+});
 
 /** Records each Tool step call; answers with `answer`, or, without one, only when the engine stops (a call under way). */
 class FakeTools implements ToolExecutor {
@@ -129,21 +273,21 @@ test("chat turn activity follows ordered execution events, not slot allocation o
   const sessionId = adapter.starts[0]!.start.sessionId;
   const chat = async () => (await runOf(engine, runId)).steps.n_chat!;
   expect(await chat()).toMatchObject({ working: true, turnStatus: "unknown" });
-  await emit(sessionId, { type: "turn-start" });
+  await emit(sessionId, { type: "turn-start", turnId: "turn_test", interruptible: true });
   expect((await chat()).turnStatus).toBe("running");
   const runningSeq = (await chat()).eventSeq;
-  await engine.onHarnessEvent(sessionId, { type: "turn-end" }, { runnerId, seq: runningSeq });
+  await engine.onHarnessEvent(sessionId, { type: "turn-end", turnId: "turn_test" }, { runnerId, seq: runningSeq });
   expect((await chat()).turnStatus).toBe("running");
-  await emit(sessionId, { type: "turn-end" });
+  await emit(sessionId, { type: "turn-end", turnId: "turn_test" });
   expect((await chat()).turnStatus).toBe("idle");
   adapter.online = false;
   await engine.sendChat(runId, "Another request");
   expect((await chat()).turnStatus).toBe("idle");
-  await emit(sessionId, { type: "turn-start" });
+  await emit(sessionId, { type: "turn-start", turnId: "turn_test", interruptible: true });
   expect((await chat()).turnStatus).toBe("running");
   await engine.stopRun(runId);
   expect(await chat()).toMatchObject({ status: "failed", turnStatus: "idle" });
-  await emit(sessionId, { type: "turn-start" });
+  await emit(sessionId, { type: "turn-start", turnId: "turn_test", interruptible: true });
   expect((await chat()).turnStatus).toBe("idle");
 });
 
@@ -152,18 +296,170 @@ test("chat turn activity remains separate from questions and becomes unknown aft
   const runId = await engine.startRun(workflow.id);
   const sessionId = adapter.starts[0]!.start.sessionId;
   await startDelivered(engine, sessionId);
-  await emit(sessionId, { type: "turn-start" });
+  await emit(sessionId, { type: "turn-start", turnId: "turn_test", interruptible: true });
   await emit(sessionId, { type: "question", questionId: "rq_turn", payload: { kind: "confirm-outputs", values: {} } });
   expect((await runOf(engine, runId)).steps.n_chat).toMatchObject({ status: "waiting", working: false, turnStatus: "running" });
-  await emit(sessionId, { type: "turn-end" });
+  await emit(sessionId, { type: "turn-end", turnId: "turn_test" });
   expect((await runOf(engine, runId)).steps.n_chat).toMatchObject({ status: "waiting", turnStatus: "idle" });
-  await emit(sessionId, { type: "turn-start" });
+  await emit(sessionId, { type: "turn-start", turnId: "turn_test", interruptible: true });
   await engine.reconcile(runnerId, []);
   expect((await runOf(engine, runId)).steps.n_chat!.turnStatus).toBe("unknown");
-  await emit(sessionId, { type: "turn-start" });
+  await emit(sessionId, { type: "turn-start", turnId: "turn_test", interruptible: true });
   expect((await runOf(engine, runId)).steps.n_chat!.turnStatus).toBe("running");
   await emit(sessionId, { type: "outputs-accepted", values: { idea: "test", audience: "teams" } });
   expect((await runOf(engine, runId)).steps.n_chat).toMatchObject({ status: "succeeded", turnStatus: "idle" });
+});
+
+test("interrupt targets only the active supported turn and expires questions only after acknowledgment", async () => {
+  const { adapter, engine, emit, workflow } = await setup(chatThenStep);
+  const runId = await engine.startRun(workflow.id);
+  const sessionId = adapter.starts[0]!.start.sessionId;
+  const state = async () => (await runOf(engine, runId)).steps.n_chat!;
+  expect(await engine.interruptChat(runId, "old")).toEqual({ outcome: "stale" });
+  await emit(sessionId, { type: "turn-start", turnId: "one", interruptible: false });
+  expect(await engine.interruptChat(runId, "one")).toEqual({ outcome: "stale" });
+  await emit(sessionId, { type: "turn-start", turnId: "two", interruptible: true });
+  await emit(sessionId, { type: "question", questionId: "rq_interrupt", payload: { kind: "confirm-outputs", values: {} } });
+  adapter.online = false;
+  expect(await engine.interruptChat(runId, "two")).toEqual({ outcome: "failed" });
+  expect((await engine.db.select().from(questions))[0]!.status).toBe("pending");
+  adapter.online = true;
+  expect(await engine.interruptChat(runId, "two")).toEqual({ outcome: "requested" });
+  expect((await engine.db.select().from(questions))[0]).toMatchObject({ status: "expired", answer: null });
+  expect(await state()).toMatchObject({ status: "running", turnStatus: "running", interruptible: false, sessionId });
+  expect(adapter.stops).toEqual([]);
+  expect(adapter.answers).toEqual([]);
+  await emit(sessionId, { type: "turn-end", turnId: "one" });
+  expect((await state()).turnStatus).toBe("running");
+  await emit(sessionId, { type: "turn-end", turnId: "two" });
+  expect(await state()).toMatchObject({ status: "running", turnStatus: "idle", working: false, sessionId });
+  await emit(sessionId, { type: "turn-start", turnId: "three", interruptible: true });
+  expect(await engine.interruptChat(runId, "two")).toEqual({ outcome: "stale" });
+  expect(adapter.interrupts).toEqual([[sessionId, "two"], [sessionId, "two"]]);
+});
+
+test("a late interrupt acknowledgment cannot withdraw a newer turn's question", async () => {
+  const { adapter, engine, emit, workflow } = await setup(chatThenStep);
+  const runId = await engine.startRun(workflow.id);
+  const sessionId = adapter.starts[0]!.start.sessionId;
+  await emit(sessionId, { type: "turn-start", turnId: "old", interruptible: true });
+  await emit(sessionId, { type: "question", questionId: "rq_old", payload: { kind: "confirm-outputs", values: {} } });
+  let acknowledge!: (outcome: "requested") => void;
+  const held = new Promise<"requested">((resolve) => { acknowledge = resolve; });
+  const interrupt = vi.spyOn(adapter, "interrupt").mockImplementation(() => held);
+  const requested = engine.interruptChat(runId, "old");
+  await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
+  // Queued native/cloud input starts its next turn without an idle event for the old one.
+  await emit(sessionId, { type: "turn-start", turnId: "new", interruptible: true });
+  await emit(sessionId, { type: "question", questionId: "rq_new", payload: { kind: "confirm-outputs", values: {} } });
+  acknowledge("requested");
+  expect(await requested).toEqual({ outcome: "requested" });
+  expect((await engine.db.select().from(questions).where(eq(questions.runnerQuestionId, "rq_old")))[0]!.status).toBe("expired");
+  expect((await engine.db.select().from(questions).where(eq(questions.runnerQuestionId, "rq_new")))[0]!.status).toBe("pending");
+  expect((await runOf(engine, runId)).steps.n_chat).toMatchObject({ turnId: "new", interruptible: true, turnStatus: "running" });
+});
+
+test.each([[false, false], [true, false], [false, true], [true, true]])("interrupted slot respects newer accepted input (new input: %s, end before acknowledgment: %s)", async (newInput, endFirst) => {
+  const { adapter, engine, emit, workflow } = await setup(chatThenStep);
+  const runId = await engine.startRun(workflow.id);
+  const sessionId = adapter.starts[0]!.start.sessionId;
+  await engine.sendChat(runId, "First input");
+  await emit(sessionId, { type: "turn-start", turnId: "first", interruptible: true });
+  let acknowledge!: (outcome: "requested") => void;
+  const held = new Promise<"requested">((resolve) => { acknowledge = resolve; });
+  const interrupt = vi.spyOn(adapter, "interrupt").mockImplementation(() => held);
+  const requested = engine.interruptChat(runId, "first");
+  await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
+  if (newInput) await engine.sendChat(runId, "New input");
+  if (endFirst) await emit(sessionId, { type: "turn-end", turnId: "first" });
+  acknowledge("requested");
+  await requested;
+  if (!endFirst) await emit(sessionId, { type: "turn-end", turnId: "first" });
+  expect((await runOf(engine, runId)).steps.n_chat).toMatchObject({ turnStatus: "idle", working: newInput });
+  expect((await engine.db.select().from(messages).where(eq(messages.role, "user")).orderBy(messages.position)).map((m) => m.text)).toEqual(newInput ? ["First input", "New input"] : ["First input"]);
+  if (newInput) {
+    await emit(sessionId, { type: "turn-start", turnId: "second", interruptible: true });
+    await emit(sessionId, { type: "text", delta: "New answer" });
+    await emit(sessionId, { type: "turn-end", turnId: "second" });
+    expect((await runOf(engine, runId)).steps.n_chat).toMatchObject({ turnStatus: "idle", working: false, interruptAfterPosition: null });
+  }
+});
+
+test("repeated interrupt cleanup preserves a cloud continuation queued after its turn ended", async () => {
+  const { context, adapter, engine, workflow, harness } = await setup(chatThenStep);
+  await context.db.update(harnessesTable).set({ maxWorking: 1 }).where(eq(harnessesTable.id, harness.id));
+  const runId = await engine.startRun(workflow.id);
+  const sessionId = adapter.starts[0]!.start.sessionId;
+  await context.db.update(stepRuns).set({ runnerId: CLOUD_SOURCE }).where(eq(stepRuns.sessionId, sessionId));
+  let seq = 0;
+  const cloudEvent = (event: Parameters<Engine["onHarnessEvent"]>[1]) => engine.onHarnessEvent(sessionId, event, { runnerId: CLOUD_SOURCE, seq: ++seq });
+  await cloudEvent({ type: "turn-start", turnId: "first", interruptible: true });
+  await engine.sendChat(runId, "Queued before Stop");
+  await cloudEvent({ type: "question", questionId: "approval", payload: { kind: "confirm-outputs", values: {} } });
+  const otherRun = await engine.startRun(workflow.id);
+  expect((await runOf(engine, otherRun)).steps.n_chat!.working).toBe(true);
+  let queuedAt: Date | null = null;
+  vi.spyOn(adapter, "interrupt").mockImplementation(async () => {
+    await cloudEvent({ type: "turn-end", turnId: "first" });
+    expect(await engine.claimCloudTurn(sessionId)).toBe(false);
+    queuedAt = (await runOf(engine, runId)).steps.n_chat!.queuedAt;
+    expect(queuedAt).not.toBeNull();
+    return "requested";
+  });
+  expect(await engine.interruptChat(runId, "first")).toEqual({ outcome: "requested" });
+  expect((await runOf(engine, runId)).steps.n_chat).toMatchObject({ queuedAt, pendingAction: { kind: "deliver" }, working: false, turnStatus: "idle" });
+  // A replayed acknowledgment must leave the same queue position intact too.
+  await cloudEvent({ type: "interrupt-result", requestId: "replay", turnId: "first", outcome: "requested" });
+  expect((await runOf(engine, runId)).steps.n_chat).toMatchObject({ queuedAt, pendingAction: { kind: "deliver" }, working: false });
+  await engine.stopRun(otherRun);
+  await vi.waitFor(async () => expect((await runOf(engine, runId)).steps.n_chat).toMatchObject({ working: true, queuedAt: null }));
+});
+
+test("a replayed interrupt acknowledgment withdraws only its matching turn", async () => {
+  const { adapter, engine, emit, workflow } = await setup(chatThenStep);
+  const runId = await engine.startRun(workflow.id);
+  const sessionId = adapter.starts[0]!.start.sessionId;
+  await emit(sessionId, { type: "turn-start", turnId: "current", interruptible: true });
+  await emit(sessionId, { type: "question", questionId: "rq_replay", payload: { kind: "confirm-outputs", values: {} } });
+  await emit(sessionId, { type: "interrupt-result", requestId: "int_old", turnId: "previous", outcome: "requested" });
+  expect((await engine.db.select().from(questions))[0]!.status).toBe("pending");
+  await emit(sessionId, { type: "interrupt-result", requestId: "int_current", turnId: "current", outcome: "requested" });
+  expect((await engine.db.select().from(questions))[0]).toMatchObject({ status: "expired", answer: null });
+  expect((await runOf(engine, runId)).steps.n_chat).toMatchObject({ status: "running", turnStatus: "running", interruptible: false });
+});
+
+test("a persisted interruption boundary settles a replayed turn-end without the lost acknowledgment", async () => {
+  const { adapter, engine, emit, workflow } = await setup(chatThenStep);
+  const runId = await engine.startRun(workflow.id);
+  const sessionId = adapter.starts[0]!.start.sessionId;
+  await engine.sendChat(runId, "Input");
+  await emit(sessionId, { type: "turn-start", turnId: "current", interruptible: true });
+  await emit(sessionId, { type: "question", questionId: "rq_interrupted", payload: { kind: "confirm-outputs", values: {} } });
+  adapter.interruptOutcome = "failed";
+  expect(await engine.interruptChat(runId, "current")).toEqual({ outcome: "failed" });
+  // The harness did stop; its persisted end arrives after the request timed out or the server restarted.
+  await emit(sessionId, { type: "turn-end", turnId: "current" });
+  expect((await engine.db.select().from(questions))[0]).toMatchObject({ status: "expired", answer: null });
+  expect((await runOf(engine, runId)).steps.n_chat).toMatchObject({ working: false, turnStatus: "idle", status: "running" });
+});
+
+test.each(["requested", "stale", "failed"] as const)("native interruption awaits its correlated acknowledgment (%s)", async (outcome) => {
+  const { context, adapter: fake, engine, workflow, runnerId } = await setup(chatThenStep);
+  await engine.startRun(workflow.id);
+  const sessionId = fake.starts[0]!.start.sessionId;
+  const send = vi.fn<(runnerId: string, message: ServerToRunner) => Promise<boolean>>().mockResolvedValue(true);
+  const adapter = new CliHarnessAdapter(context.db, { send } as unknown as RunnerHub);
+  const pending = adapter.interrupt(sessionId, "turn_native");
+  let settled = false;
+  void pending.then(() => { settled = true; });
+  await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+  const request = send.mock.calls[0]![1] as unknown as { requestId: string };
+  expect(settled).toBe(false);
+  adapter.acknowledge("different_runner", sessionId, { type: "interrupt-result", requestId: request.requestId, turnId: "turn_native", outcome });
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  adapter.acknowledge(runnerId, sessionId, { type: "interrupt-result", requestId: request.requestId, turnId: "turn_native", outcome });
+  expect(await pending).toBe(outcome);
 });
 
 test("the agent's model overrides the harness's", async () => {
