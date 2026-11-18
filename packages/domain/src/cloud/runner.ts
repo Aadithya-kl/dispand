@@ -1,4 +1,6 @@
-import { type Answer, type HarnessEvent, ID, type QuestionPayload, SHORT, TEXT } from "@dispand/runner-protocol";
+import { type Answer, ID, type QuestionPayload, SHORT, TEXT } from "@dispand/runner-protocol";
+import type { CloudEvent } from "../messages/record-result.ts";
+import { isRecordTool, recordResultOf } from "./record-result.ts";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "../db/client.ts";
 import { cloudSessions, runs, stepRuns, type MessageFile } from "../db/schema.ts";
@@ -104,7 +106,7 @@ export const noTools: ToolCaller = {
 
 type Row = typeof cloudSessions.$inferSelect;
 type Patch = Partial<Omit<Row, "id" | "seq" | "lastEvent">>;
-type Handler = (sessionId: string, event: HarnessEvent, seq: number) => Promise<void>;
+type Handler = (sessionId: string, event: CloudEvent, seq: number) => Promise<void>;
 type Execution = { controller: AbortController; text: string; turnId: string };
 
 /** A provider may finish after cancellation; its detached result cannot write into the next turn. */
@@ -360,7 +362,7 @@ export class CloudRunner implements HarnessAdapter<CloudHarness> {
   }
 
   /** Writes a state change with its event and seq in one statement, then hands the event to the engine. Call it locked. */
-  private async emit(id: string, patch: Patch, event: HarnessEvent) {
+  private async emit(id: string, patch: Patch, event: CloudEvent) {
     const [row] = await this.db
       .update(cloudSessions)
       .set({ ...patch, seq: sqlIncrement(), lastEvent: event })
@@ -369,7 +371,7 @@ export class CloudRunner implements HarnessAdapter<CloudHarness> {
     if (row) await this.deliver(id, event, row.seq);
   }
 
-  private async deliver(id: string, event: HarnessEvent, seq: number) {
+  private async deliver(id: string, event: CloudEvent, seq: number) {
     try {
       await this.handler(id, event, seq);
     } catch (err) {
@@ -545,7 +547,10 @@ export class CloudRunner implements HarnessAdapter<CloudHarness> {
       call.name === ASK_USER || (call.name === SUBMIT_OUTPUTS && offersSubmit(row.start)) || call.name === REQUEST_APPROVAL || call.name === READ_SKILL || (call.name === CONSULT && consults.length > 0);
     const { specs, names } = await this.specs(row.id);
     const key = builtin ? undefined : names.fromName(call.name);
-    const label = cut(specs.find((s) => s.key === key)?.label ?? call.name, ID);
+    const selected = specs.find((s) => s.key === key);
+    const label = cut(selected?.label ?? call.name, ID);
+    // Provider call ids may repeat across model responses in one turn; each read owns its snapshot.
+    const recordCall = isRecordTool(selected) && typeof call.args === "object" && call.args !== null && "id" in call.args && typeof call.args.id === "string" ? { toolCallId: newId("call"), turnId: execution.turnId, args: { id: call.args.id } } : undefined;
     const approved = row.approvedCall === call.id;
     const done = (text: string, isError: boolean, extra: Patch = {}) =>
       this.emit(id, { items: items(text, isError), ...extra }, { type: "tool", name: label, status: "done" });
@@ -554,7 +559,7 @@ export class CloudRunner implements HarnessAdapter<CloudHarness> {
       const [now] = await this.db.select({ status: cloudSessions.status }).from(cloudSessions).where(eq(cloudSessions.id, id));
       if (now?.status !== "running") return null;
       // Shown once per call: not again when it runs after the owner allowed it.
-      if (!approved) await this.emit(id, {}, { type: "tool", name: label, status: "started" });
+      if (!approved) await this.emit(id, {}, recordCall ? { type: "record-start", ...recordCall } : { type: "tool", name: label, status: "started" });
       const ask = async (payload: QuestionPayload, askedKey?: string) => {
         const questionId = newId("cq");
         const event = questionEvent(questionId, payload);
@@ -629,7 +634,11 @@ export class CloudRunner implements HarnessAdapter<CloudHarness> {
       outcome = { text: "The tool call failed.", isError: true };
     }
     // A stopped session keeps its state as the stop left it.
-    await this.active(id, execution, () => done(outcome.text, outcome.isError, { inFlight: null }));
+    await this.active(id, execution, async () => {
+      const record = !outcome.isError && recordCall ? recordResultOf(outcome) : undefined;
+      if (record && recordCall) return this.emit(id, { items: items(outcome.text, false), inFlight: null }, { type: "record-result", ...recordCall, args: { id: record.rowId }, record });
+      await done(outcome.text, outcome.isError, { inFlight: null });
+    });
   }
 
   /** The owner (or, `by`, an agent) answered the question the session waits on, for `call`. Call it locked. */
