@@ -9,7 +9,7 @@ import { useCallback, useLayoutEffect, useMemo, useState, useSyncExternalStore, 
 import { useTranslation } from "react-i18next";
 import { api, orpc } from "../../lib/api.ts";
 import { canReopen, type RunSnapshot } from "../../lib/run-state.ts";
-import { refreshRun, useRun } from "../../lib/run-watch.ts";
+import { refreshRun, useRunWatch } from "../../lib/run-watch.ts";
 import { ChatThread, turnActionKey } from "../chat/Thread.tsx";
 import { useStored } from "@/lib/message";
 import { ChatSession, useChatSessions } from "../../lib/chat-sessions.tsx";
@@ -59,7 +59,7 @@ export function ChatSessionHost({ session }: { session: ChatSession }) {
   const sessions = useChatSessions();
   const { workflowId, start, runId, onRunStarted, onNewConversation, welcome, composerTools, assistantAgentId } = useSyncExternalStore(session.subscribe, session.getOptions, session.getOptions);
   const active = useSyncExternalStore(session.subscribe, session.getActive, session.getActive);
-  const run = useRun(active ? runId : null);
+  const { state: run, interrupted } = useRunWatch(active ? runId : null);
   const version = run?.run.version;
   const versionDef = useQuery({
     ...orpc.workflows.get.queryOptions({ input: { id: workflowId ?? "", version: version ?? 0 } }),
@@ -201,6 +201,7 @@ export function ChatSessionHost({ session }: { session: ChatSession }) {
     ] : [],
   });
   const view = <div className="flex min-h-0 flex-1 flex-col">
+    <p role="status" className="mx-auto w-full max-w-3xl shrink-0 px-4 py-2 text-[13px] text-muted empty:py-0">{interrupted ? t("reconnecting") : null}</p>
     <ChatThread runtime={runtime} run={run} chatStepId={chatStep?.id} canSend={canSend && !sending && holding === 0} canDraft={open && waiting !== "question"} onSend={send} onAttach={hold}
       welcome={welcome} starterPrompts={!!assistantAgentId} centeredWelcome={!!composerTools}
       composer={<ChatComposer runId={runId} assistantAgentId={assistantAgentId} tools={composerTools} open={open} waiting={waiting}
