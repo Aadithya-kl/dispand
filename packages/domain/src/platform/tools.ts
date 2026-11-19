@@ -630,6 +630,12 @@ export const NOT_TOOLS: string[] = [
   // or changes it, not even through a proposal.
   "workspace.managed",
   "workspace.people",
+  "workspace.invite",
+  "workspace.invitations",
+  "workspace.invitation",
+  "workspace.acceptInvitation",
+  "workspace.revokeInvitation",
+  "workspace.registerInvitation",
   "workspace.removePerson",
   "workspace.auditRetention",
   "workspace.setAuditRetention",
