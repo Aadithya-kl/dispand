@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { PageHeader } from "../components/Placeholder.tsx";
+import { WorkspaceInvitations } from "../components/settings/WorkspaceInvitations.tsx";
 import { List } from "../components/settings/parts.tsx";
 import { orpc, type api } from "../lib/api.ts";
 
@@ -19,9 +20,14 @@ function People() {
     <PageHeader title={t("people.title")} />
     {managed.isError ? <p role="alert">{t("people.loadFailed")}</p>
       : !managed.data ? <p role="status">{t("loading")}</p>
-      : managed.data.length === 1 ? <Directory key={managed.data[0]!.workspaceId} scope={managed.data[0]!} />
+      : managed.data.length === 1 ? <WorkspacePeople key={managed.data[0]!.workspaceId} scope={managed.data[0]!} />
       : <p>{t("people.unavailable")}</p>}
   </>;
+}
+
+function WorkspacePeople({ scope: workspace }: { scope: Awaited<ReturnType<typeof api.workspace.managed>>[number] }) {
+  const scope = { workspaceId: workspace.workspaceId, organizationId: workspace.organizationId };
+  return <><Directory scope={scope} /><WorkspaceInvitations scope={scope} names={workspace} /></>;
 }
 
 function Directory({ scope }: { scope: Scope }) {
