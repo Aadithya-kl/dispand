@@ -1,6 +1,6 @@
 import { MAX_FILE_BYTES, MAX_RESULT_FILES, resultRefusal } from "@dispand/runner-protocol";
 import { ORPCError } from "@orpc/server";
-import { and, count, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, count, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { mkdir, open, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -11,6 +11,7 @@ import { newId } from "../ids.ts";
 import { message } from "../messages/index.ts";
 import { authed, base } from "../rpc/context.ts";
 import { meter } from "../telemetry/index.ts";
+import { hasLegacyWorkspaceAccess, readableRun } from "../workspace/access.ts";
 import type { ToolResult } from "../tools/mcp.ts";
 
 // Files of attachment cells. Each one is `<filesDir>/<ownerId>/<attachmentId>`: both ids are made
@@ -266,20 +267,21 @@ export async function attachmentsById(db: Db, ownerId: string, ids: string[]): P
   return Object.fromEntries(found.map((a) => [a.id, attachmentView(a)]));
 }
 
-/** One of the owner's files, ready to stream; null if it isn't theirs or is gone. */
-export async function openAttachment(
-  db: Db,
-  filesDir: string,
-  ownerId: string,
-  id: string,
-): Promise<{ body: ReadableStream<Uint8Array>; name: string; mime: string; size: number; image: boolean } | null> {
-  const [found] = await db
-    .select()
-    .from(attachments)
-    .where(and(eq(attachments.id, id), eq(attachments.ownerId, ownerId)));
-  if (!found) return null;
+/** Other Job readers can download only a file attached to a person's committed transcript message. */
+export async function openAttachment(db: Db, filesDir: string, userId: string, id: string) {
+  const [row] = await db.select({ file: attachments }).from(attachments)
+    .leftJoin(runs, and(eq(runs.id, attachments.jobId), eq(runs.ownerId, attachments.ownerId)))
+    .where(and(eq(attachments.id, id), or(
+      and(eq(attachments.ownerId, userId), or(isNull(attachments.jobId), isNotNull(attachments.tableId))),
+      and(isNull(attachments.tableId), readableRun({ db, ownerId: userId }), or(eq(attachments.ownerId, userId), inUserMessage)),
+    )));
+  if (!row || (row.file.tableId !== null && !await hasLegacyWorkspaceAccess({ db, ownerId: userId }))) return null;
+  return streamAttachment(filesDir, row.file);
+}
+
+async function streamAttachment(filesDir: string, found: typeof attachments.$inferSelect) {
   try {
-    const handle = await open(join(ownerDir(filesDir, ownerId), found.id));
+    const handle = await open(join(ownerDir(filesDir, found.ownerId), found.id));
     const body = Readable.toWeb(handle.createReadStream()) as ReadableStream<Uint8Array>;
     return { body, name: found.name, mime: found.mime, size: found.size, image: found.image };
   } catch (err) {
@@ -296,12 +298,12 @@ export async function openAttachment(
  */
 export async function attachmentForRunner(db: Db, filesDir: string, runnerId: string, id: string) {
   const [found] = await db
-    .select({ ownerId: attachments.ownerId })
+    .select({ file: attachments })
     .from(attachments)
     .innerJoin(stepRuns, and(eq(stepRuns.runId, attachments.jobId), eq(stepRuns.runnerId, runnerId), eq(stepRuns.ownerId, attachments.ownerId)))
     .where(and(eq(attachments.id, id), inMessage))
     .limit(1);
-  return found ? openAttachment(db, filesDir, found.ownerId, id) : null;
+  return found ? streamAttachment(filesDir, found.file) : null;
 }
 
 /** The bytes of these files of the owner, by id: a file gone (swept, its Job deleted) is missing. */
@@ -323,8 +325,10 @@ const referenced = sql`exists (select 1 from ${rowsTable} where ${rowsTable.tabl
   and jsonb_path_exists(${rowsTable.values}, '$.*[*] ? (@ == $id)', jsonb_build_object('id', ${attachments.id})))`;
 
 /** A message of the attachment's Job carries it: the chat's history reads it at every turn. */
-const inMessage = sql`exists (select 1 from ${messages} where ${messages.runId} = ${attachments.jobId}
-  and ${messages.files} @> jsonb_build_array(jsonb_build_object('id', ${attachments.id})))`;
+const carriesFile = sql`${messages.runId} = ${attachments.jobId}
+  and ${messages.files} @> jsonb_build_array(jsonb_build_object('id', ${attachments.id}))`;
+const inMessage = sql`exists (select 1 from ${messages} where ${carriesFile})`;
+const inUserMessage = sql`exists (select 1 from ${messages} where ${carriesFile} and ${messages.role} = 'user')`;
 
 /**
  * What the sweep removes, `cutoff` being an hour ago and `heldCutoff` a day ago: a table's file no
