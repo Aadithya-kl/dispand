@@ -302,6 +302,28 @@ test("the studio: a second conversation's setup stops at a name taken, goes on, 
   expect(made.find((t) => t.name === "New feature")).toMatchObject({ agentId: designer.id, config: { kind: "primitive", tableId: owned.features } });
   expect(made.find((t) => t.name === "Monday review")).toMatchObject({ config: { kind: "schedule", cron: "0 9 * * 1" } });
 
+  // Inspect saved scope after the live conversation has completed its follow-up.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.reload();
+  await box.fill("Which changes were refused?");
+  const history = chat.getByRole("region", { name: "Proposal" }).filter({ has: page.getByRole("button", { name: `${items.length} proposed changes`, exact: true }) });
+  const scope = history.getByRole("button", { name: `${items.length} proposed changes`, exact: true });
+  const changes = history.getByRole("list", { name: "What is proposed" });
+  await expect(scope).toHaveAttribute("aria-expanded", "false");
+  await expect(changes).toBeHidden();
+  await scope.focus();
+  await scope.scrollIntoViewIfNeeded();
+  const position = () => scope.evaluate((button) => button.getBoundingClientRect().top);
+  const before = await position();
+  await scope.press("Enter");
+  await expect(changes.getByRole("listitem")).toHaveCount(items.length);
+  await expect(scope).toBeFocused();
+  expect(Math.abs(await position() - before)).toBeLessThanOrEqual(1);
+  await scope.press("Space");
+  await expect(changes).toBeHidden();
+  await expect(scope).toBeFocused();
+  await expect(box).toHaveValue("Which changes were refused?");
+
   await chat.getByRole("button", { name: "GitHub", exact: true }).click();
   await expect(page.getByRole("dialog").getByText(/^Needs sign-in: enter its Personal access token/)).toBeVisible();
 });
@@ -811,8 +833,14 @@ test.describe("French browser", () => {
     }
 
     await page.goto("/inbox");
-    const proposal = page.getByRole("list", { name: "Ce qui est proposé" }).first();
-    await expect(proposal).toBeVisible();
+    const scopeButton = page.getByRole("button", { name: /^\d+ modifications? proposées?$/ });
+    const article = page.getByRole("article").filter({ has: scopeButton }).first();
+    const scope = article.locator(scopeButton);
+    await expect(scope).toHaveAttribute("aria-expanded", "false");
+    await scope.click();
+    await expect(scope).toBeFocused();
+    await expect(scope).toHaveAttribute("aria-expanded", "true");
+    await expect(article.getByRole("list", { name: "Ce qui est proposé" })).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   });
 });
