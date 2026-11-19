@@ -1,5 +1,5 @@
-import en from "./en.json";
-import fr from "./fr.json";
+import en from "./en.json" with { type: "json" };
+import fr from "./fr.json" with { type: "json" };
 
 // What the server says to a person: a key of these resources and its values, which the page
 // translates (`apps/web/src/lib/api.ts`), never a sentence built here. The English sentence goes
@@ -11,7 +11,7 @@ type Leaves<T, P extends string = ""> = {
 type Singular<K extends string> = K extends `${infer Base}_${"zero" | "one" | "two" | "few" | "many" | "other"}` ? Base : K;
 
 /** A server message's key: every sentence of `en.json`, a plural's forms under one key. */
-export type MessageKey = Singular<Leaves<typeof en>>;
+export type MessageKey = Singular<Leaves<typeof resources.en>>;
 /** A list value reads as the language writes a list ("A, B and C"): the page formats it, the English sentence here. */
 export type MessageValues = Record<string, string | number | string[]>;
 /** An error's data when its text reaches a person: what to translate, with what. */
