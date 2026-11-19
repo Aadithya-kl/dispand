@@ -109,5 +109,8 @@
   "artifactFailed": "Cet artefact ne s’est pas affiché comme prévu. Son code contient peut-être une erreur.",
   "artifactLinkTitle": "Ouvrir ce lien ?",
   "artifactLinkText": "L’artefact demande à ouvrir cette adresse dans un nouvel onglet :",
+  "artifactExpand": "Agrandir",
+  "artifactGenerated": "Généré par l’agent. N’y saisissez ni mot de passe ni secret.",
+  "artifactCollapse": "Réduire",
   "artifactOpen": "Ouvrir"
 }
