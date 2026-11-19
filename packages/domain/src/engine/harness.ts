@@ -34,6 +34,21 @@ export function isCloud(h: Harness): h is CloudHarness {
 }
 
 /**
+ * How a harness steers (`HarnessAdapter.steer`: a message joins the turn running now). Every
+ * harness does, attachments included (a CLI gets them in its run folder before the text, a cloud
+ * session with the message), and each says with `steer-result` once it took the message.
+ * `interruptsTools`: steering stops the tools running in that turn. Claude Code takes a message at
+ * once only by cutting its running turn (`priority: "now"`), and Dispand reports that and the turn
+ * the CLI starts for it as one. Codex takes it beside them (`turn/steer`), a cloud session at its
+ * next model call.
+ */
+export type Steering = { interruptsTools: boolean };
+
+export function steering(h: Harness): Steering {
+  return { interruptsTools: !isCloud(h) && h.kind === "claude-code" };
+}
+
+/**
  * What the engine decides about a session; the harness adds where and how it runs. `runKey` names a per-run directory.
  * Skills and MCP servers aren't sent yet: every start carries none.
  */
@@ -63,6 +78,12 @@ export interface HarnessAdapter<H extends Harness = Harness> {
   start(harness: H, start: StartParams): Promise<boolean>;
   /** `files`: what the person attached to this chat message, attachments of the session's Job. */
   send(sessionId: string, text: string, files?: MessageFile[]): Promise<boolean>;
+  /**
+   * Sends a message that joins turn `turnId` while it runs, as `steering` says;
+   * otherwise it goes like `send`, once either way. A `steer-result` event with `requestId` then
+   * says whether it joined the turn (`steered`) or went as the next message (`queued`).
+   */
+  steer?(sessionId: string, turnId: string, requestId: string, text: string, files?: MessageFile[]): Promise<boolean>;
   narrowPermissions?(sessionId: string, db?: Db): Promise<boolean>;
   /** `by`: the agent that gave it (`inbox`), which the session is told with the answer; none for a person's. */
   answer(sessionId: string, questionId: string, answer: Answer, by?: AgentAnswerer): Promise<boolean>;

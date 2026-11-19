@@ -12,7 +12,7 @@
 - **Runners:** `runners.create` (owner) makes a runner and a single-use pairing code (8
   characters, 15 minutes); the runner trades it at `POST /runner/pair` (public) for a token
   (32 random bytes, stored as SHA-256). It then dials `/runner/ws` with
-  `Authorization: Bearer <token>` and `Dispand-Protocol: 29` (`PROTOCOL_VERSION`, bumped by
+  `Authorization: Bearer <token>` and `Dispand-Protocol: 33` (`PROTOCOL_VERSION`, bumped by
   every change an older runner can't parse or honor). An older runner is refused with 426 "update
   the runner" and its version recorded (`runners.protocol_version`; runners seen before protocol 2
   were set to 1 by migration 0009), so `runners.list` reports it `outdated` with the command that
@@ -1238,6 +1238,25 @@
   `runner.attachment`), writes it read-only in the run folder, then hands the text to the CLI;
   if it can't, the text goes with a line saying so. The files stay with the run folder for later
   turns and resumes. Runner protocol 28.
+- **Steering (protocol 33):** `HarnessAdapter.steer` sends a chat message that joins the turn
+  running now (`turnId`); when that turn isn't running, it goes like `send`. Whoever holds the
+  turn's state decides, atomically, so a steer that meets the turn's end is delivered once, as the
+  next message: never lost, never twice. It then reports a `steer-result` event (`steered` or
+  `queued`, with the caller's `requestId`). `steering(harness)` says how each harness does it
+  (`interruptsTools`); every one takes the message's attachments. For a CLI session it is a
+  `session.send` with `steer: { turnId, requestId }`, handled in the session's message order. Codex
+  steers through the app-server's `turn/steer` (`expectedTurnId`, a `clientUserMessageId`), beside
+  the running tools: the message joined the turn once Codex shows that user message; a refused
+  steer, or one the turn ended without (Codex drops it on an interrupt), starts the next turn.
+  Claude Code takes a message with `priority: "now"`: its CLI stops the running tools, ends its turn
+  (`aborted_tools` or `aborted_streaming`) and starts the message at once (`command_lifecycle`
+  `started`, or its uuid among a result's `user_message_uuids`). The runner reports the cut turn and
+  that one as a single turn; a result that ends the turn otherwise first makes the steer the next
+  message. As `now` is bound to no turn, the runner steers only while the turn's own message is the
+  only one waiting and no question waits; a question asked while the steer is on its way makes the
+  cut a turn of its own, so the engine withdraws it. A cloud session queues it under its lock: while turn `turnId` runs, the next model call
+  reads it and the turn goes on until no message is left (`steered`); otherwise it starts the next
+  turn.
 - **Secrets at rest:** `packages/domain/src/secrets.ts` is the one secret box (the tool headers use it too). `createSecretBox(key)`
   seals with AES-256-GCM and a random 12-byte IV into `v1.<iv>.<ciphertext+tag>` (base64url);
   `seal` and `open` take an AAD, `secretAad(table, rowId, field, origin?)`, which binds the value
