@@ -296,8 +296,10 @@ async function snapshot({ db, ownerId }: RunReader, run: typeof runsTable.$infer
     db.select().from(questions).where(eq(questions.runId, runId)).orderBy(asc(questions.createdAt)),
     ownerId !== run.ownerId ? [] : db.select().from(chatQueue).where(and(eq(chatQueue.runId, runId), inArray(chatQueue.state, ["pending", "failed"]))).orderBy(asc(chatQueue.position)),
   ]);
+  // A workflow run keeps no def: its version's says whether its chat can continue.
+  const def = run.def ?? (run.workflowId ? await defOf(db, run.workflowId, run.version) : null);
   return {
-    run: runView(run),
+    run: runView(run, def),
     steps: steps.map(stepView),
     messages: transcript.map(messageView),
     queue: queued.map(queuedView),
@@ -327,13 +329,13 @@ const start = owner.input(z.object({ workflowId: z.string() })).handler(async ({
 });
 
 const sendChat = owner
-  .input(z.object({ runId: z.string(), text: StorableText(100_000).trim().min(1), skillId: z.string().max(64).optional(), attachmentIds: z.array(z.string().max(64)).max(MAX_RESULT_FILES).optional() }))
+  .input(z.object({ runId: z.string(), text: StorableText(100_000).trim().min(1), continueChat: z.boolean().optional(), skillId: z.string().max(64).optional(), attachmentIds: z.array(z.string().max(64)).max(MAX_RESULT_FILES).optional() }))
   .handler(async ({ input, context }) => {
     await requireOwnedRun(context, input.runId);
     if (context.job && input.skillId) throw new ORPCError("FORBIDDEN", message("workflows.ownerSkill"));
     // Files held for the owner (`files.hold`) go only with the owner's own message.
     if (context.job && input.attachmentIds?.length) throw new ORPCError("FORBIDDEN", message("data.file.agentOnly"));
-    return context.engine.sendChat(input.runId, input.text, input.skillId, input.attachmentIds ?? []).catch(engineError);
+    return context.engine.sendChat(input.runId, input.text, input.skillId, input.attachmentIds ?? [], !context.job && input.continueChat).catch(engineError);
   });
 
 /** The owner sends a pending queued message now, into the agent's running turn (`Engine.steerQueued`). */

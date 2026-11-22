@@ -1930,15 +1930,23 @@ for managed MCP approvals are unchanged. `native-permissions.ts` is pure policy 
 I/O or content telemetry; the operational paths retain their existing session/question events.
 
 
-### Continuing a finished Job chat
+### Continuing an ended chat
 
-A successful Job chat with a recorded CLI or cloud transcript accepts another owner message
-in the same Job. The existing chat step and its messages remain in that thread; the new turn
-gets a fresh session id, Job token and chat root cause, with completion timestamps cleared.
-The message and the `job.reopened` owner Audit row commit with that transition. Failed or
-stopped Jobs, workflow runs, deleted agents and chats without recorded history remain closed.
-A revoked historical runner is refused without reopening the Job. A new conversation still
-starts a separate Job.
+An owner can continue a chat in the same run after it ended: a Job chat that finished, failed
+or was stopped, and a workflow run whose chat trigger is where it failed, stopped or finished.
+Its definition identifies the chat step even when the harness failed before creating a session.
+The owner's message and, for a Job, its fresh token and root and the `job.reopened` Audit row,
+commit together. An explicit continuation checks current harness settings. A compatible session
+resumes its transcript; a resume the runner got that failed before any activity is taken as a
+transcript gone. When no transcript can resume or the harness changed, the normal start path
+creates a fresh session on the same step, told the conversation so far in its start prompt (the
+newest turns that fit the prompt bound); the owner's messages since the agent's last answer go
+to it again as messages, with their files. Its visible messages, attachments, and questions keep
+their IDs. A failed workflow's steps after the chat that never started wait for it again; steps
+that already ran, or a finished run's skipped branches, don't run again. A send racing a failure
+keeps its draft for the owner to edit or resend. A message queued before a run failed or was
+stopped fails rather than reopening it. Deleted agents stay closed. The runner must still be authorized for any session launched on
+it.
 
 Migration 0070 adds nullable `step_runs.resume_after_session`. It records the former session
 and whether its process has ended, until the resumed start is written. Protocol 22 adds
@@ -1956,7 +1964,7 @@ so tools removed since completion are absent. Cloud sessions inherit the previou
 items under their new id after the former loop has ended. Unanswered calls from the old
 model batch are settled as interrupted before the new message is consumed; they never run
 as part of that follow-up. The former token stays invalid.
-The browser keeps watching resumable chats after success, within its normal connection cap,
+The browser keeps watching continuable chats after success or failure, within its normal connection cap,
 so the same composer can send and receive a new turn without starting another Job.
 
 ### Queued chat messages
