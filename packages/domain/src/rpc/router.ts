@@ -5,6 +5,7 @@ import { ORPCError } from "@orpc/server";
 import { count, sql } from "drizzle-orm";
 import { account, organizationMembers, organizations, user, workspaces } from "../db/schema.ts";
 import { newId } from "../ids.ts";
+import { withIdentity } from "../auth.ts";
 import { inScope, SYSTEM } from "../db/scope.ts";
 import { agents } from "../agents/procedures.ts";
 import { artifacts } from "../artifacts/procedures.ts";
@@ -56,10 +57,12 @@ const setup = base
     // Cheap refusal first: a finished install must not spend a password hash per request.
     const [existing] = await inScope(SYSTEM, () => context.db.select({ n: count() }).from(user));
     if (existing && existing.n > 0) throw new ORPCError("FORBIDDEN", message("auth.setupRefused"));
+    // First run creates the owner and their workspace atomically: only with Better Auth's tables on `db`.
+    if (context.authDb !== context.db) throw new ORPCError("FORBIDDEN", message("auth.setupRefused"));
     const ownerId = newId("user");
     const ctx = await context.auth.$context;
     const password = await ctx.password.hash(input.password);
-    await context.db.transaction(async (tx) => {
+    await withIdentity(context, async (tx) => {
       // Serializes concurrent first-run requests: the second one sees the owner and is refused.
       // (Checked again here: another request may have finished since the cheap check.)
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext('dispand:setup'))`);
@@ -73,6 +76,7 @@ const setup = base
         userId: ownerId,
         password,
       });
+    }, async (tx) => {
       const organizationId = newId("org");
       await tx.insert(organizations).values({ id: organizationId, name: input.organizationName });
       await tx.insert(organizationMembers).values({ organizationId, userId: ownerId, role: "owner" });
