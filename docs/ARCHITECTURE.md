@@ -12,7 +12,7 @@
 - **Runners:** `runners.create` (owner) makes a runner and a single-use pairing code (8
   characters, 15 minutes); the runner trades it at `POST /runner/pair` (public) for a token
   (32 random bytes, stored as SHA-256). It then dials `/runner/ws` with
-  `Authorization: Bearer <token>` and `Dispand-Protocol: 33` (`PROTOCOL_VERSION`, bumped by
+  `Authorization: Bearer <token>` and `Dispand-Protocol: 34` (`PROTOCOL_VERSION`, bumped by
   every change an older runner can't parse or honor). An older runner is refused with 426 "update
   the runner" and its version recorded (`runners.protocol_version`; runners seen before protocol 2
   were set to 1 by migration 0009), so `runners.list` reports it `outdated` with the command that
@@ -630,8 +630,11 @@
   configured server, named `job`, a name starts can't use; a same-named server of the user's
   own CLI config is replaced for the session on Claude Code, and refuses the session on Codex,
   which would merge the two), and lets `mcp__job__*` tools run
-  without a question (Claude Code: `canUseTool` and the `PreToolUse` hook; Codex: its approval
-  request for that server is accepted); every other MCP tool asks as before. The agent's page
+  without a question; every other MCP tool asks as before. Both harnesses apply the one policy
+  for a call to an MCP server's tool (`toolPolicy` in `apps/runner/src/tool-policy.ts`: disabled
+  actions, protected arguments, unasked actions, bypass, the question and what its answer
+  grants), Claude Code from `canUseTool` and the `PreToolUse` hook, Codex from its approval
+  request. The agent's page
   sets the bundles and tables (`components/settings/JobRights.tsx`).
 - **The Assistant:** the workspace's built-in agent, an `agents` row with `built_in =
   'assistant'` (migration 0048; a partial unique index keeps one per owner). No procedure's
@@ -1932,13 +1935,18 @@ I/O or content telemetry; the operational paths retain their existing session/qu
 
 ### Continuing an ended chat
 
+The transitions of a step that move several columns under one rule (its session replaced, its
+chat continued, its end, its transcript gone) are `engine/step-lifecycle.ts`'s, each with its
+guard (continuing a chat with its Audit row, span and stream events too); the engine calls them.
+
 An owner can continue a chat in the same run after it ended: a Job chat that finished, failed
 or was stopped, and a workflow run whose chat trigger is where it failed, stopped or finished.
 Its definition identifies the chat step even when the harness failed before creating a session.
 The owner's message and, for a Job, its fresh token and root and the `job.reopened` Audit row,
 commit together. An explicit continuation checks current harness settings. A compatible session
-resumes its transcript; a resume the runner got that failed before any activity is taken as a
-transcript gone. When no transcript can resume or the harness changed, the normal start path
+resumes its transcript, unless the harness said it can't (an `error` event of kind
+`cannot-resume`, protocol 34: the runner has no record of that CLI session in that folder, or
+the resumed CLI failed before reporting anything). When no transcript can resume or the harness changed, the normal start path
 creates a fresh session on the same step, told the conversation so far in its start prompt (the
 newest turns that fit the prompt bound); the owner's messages since the agent's last answer go
 to it again as messages, with their files. Its visible messages, attachments, and questions keep
