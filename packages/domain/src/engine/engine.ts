@@ -122,14 +122,15 @@ function holdsSlot(step: Pick<StepRow, "working" | "harnessId">): boolean {
 
 /**
  * The consulted agent of a consult row, for its Audit rows: its id only when it names an agent of
- * the owner, since the asking agent wrote it.
+ * the asking run's workspace, since the asking agent wrote it.
  */
 async function consultedAgent(tx: Tx, q: QuestionRow): Promise<{ agentId?: string }> {
   if (q.payload.kind !== "consult") return {};
   const [row] = await tx
     .select({ id: agents.id })
     .from(agents)
-    .where(and(eq(agents.id, q.payload.agentId), eq(agents.ownerId, q.ownerId)));
+    .innerJoin(runs, and(eq(runs.id, q.runId), eq(runs.workspaceId, agents.workspaceId)))
+    .where(eq(agents.id, q.payload.agentId));
   return row ? { agentId: row.id } : {};
 }
 
@@ -310,7 +311,7 @@ export class Engine {
     const runId = newId("run");
     // An existing root first, then the trigger and the agent (`roots.ts`); a new one is no one else's yet.
     const lockRoot = async (rootId: string) => {
-      const [root] = await tx.select().from(roots).where(and(eq(roots.id, rootId), eq(roots.ownerId, ownerId))).for("update");
+      const [root] = await tx.select().from(roots).where(eq(roots.id, rootId)).for("update");
       if (!root) throw new EngineError("NOT_FOUND", message("engine.rootNotFound"));
       if (root.state === "stopped") throw new EngineError("STOPPED", message("engine.stoppedAtCheckpoint"));
       return root;
@@ -324,15 +325,16 @@ export class Engine {
       ? await tx
           .select()
           .from(triggers)
-          .where(and(eq(triggers.id, triggerId), eq(triggers.agentId, agentId), eq(triggers.ownerId, ownerId)))
+          .where(and(eq(triggers.id, triggerId), eq(triggers.agentId, agentId)))
           .for("share")
       : [];
     const [agent] = await tx
       .select()
       .from(agents)
-      .where(and(eq(agents.id, agentId), eq(agents.ownerId, ownerId)))
+      .where(eq(agents.id, agentId))
       .for("share");
-    if (!agent) throw new EngineError("NOT_FOUND", message("agent.notFound"));
+    // A given root (a consult's, a Stem hand-off's) is of the agent's workspace, whoever's agent it is.
+    if (!agent || (given && given.workspaceId !== agent.workspaceId)) throw new EngineError("NOT_FOUND", message("agent.notFound"));
     // A consult's and a Stem Job's firing is no trigger: the consult's root is the asking Job's; a Stem Job's, the owner's hand-off.
     if (firing.type === "consult" ? triggerId || !given : firing.type === "stem" ? !!triggerId : !trigger || !trigger.enabled) throw new EngineError("NOT_FOUND", message("triggers.notFound"));
     const root = given ?? (await lockRoot(await newRoot(tx, ownerId, agent.workspaceId, cause.kind === "stem" ? "user" : (cause.kind as RootKind), runId)));
@@ -1118,15 +1120,16 @@ export class Engine {
    * it returns goes once `tx` commits (`settled`). The caller took the owner's consult lock
    * (`lockConsults`) first in `tx`.
    */
-  async endConsults(tx: Tx, ownerId: string, agentIds: string[]): Promise<Out[]> {
+  async endConsults(tx: Tx, workspaceId: string, agentIds: string[]): Promise<Out[]> {
     const out: Out[] = [];
-    const asking = tx.select({ id: runs.id }).from(runs).where(and(eq(runs.ownerId, ownerId), inArray(runs.agentId, agentIds)));
+    const asking = tx.select({ id: runs.id }).from(runs).where(and(eq(runs.workspaceId, workspaceId), inArray(runs.agentId, agentIds)));
+    const ofWorkspace = tx.select({ id: runs.id }).from(runs).where(eq(runs.workspaceId, workspaceId));
     const inFlight = await tx
       .select()
       .from(questions)
       .where(
         and(
-          eq(questions.ownerId, ownerId),
+          inArray(questions.runId, ofWorkspace),
           eq(questions.kind, "consult"),
           or(eq(questions.status, "pending"), and(eq(questions.status, "answered"), isNull(questions.deliveredAt))),
           or(inArray(questions.runId, asking), inArray(sql`${questions.payload}->>'agentId'`, agentIds)),
@@ -1168,15 +1171,15 @@ export class Engine {
    * go with them, and each consult in flight that loses its entry ends with the reason
    * (`endConsults`). What it returns goes once `tx` commits (`settled`).
    */
-  async deleteAgents(tx: Tx, ownerId: string, agentIds: string[]): Promise<Out[]> {
+  async deleteAgents(tx: Tx, ownerId: string, workspaceId: string, agentIds: string[]): Promise<Out[]> {
     if (agentIds.length === 0) return [];
     // First, as for any change of an agent's consults: a consult opened meanwhile is either seen by `endConsults` or sees this change.
-    await lockConsults(tx, ownerId);
+    await lockConsults(tx, workspaceId);
     await tx.select({ id: triggers.id }).from(triggers).where(inArray(triggers.agentId, agentIds)).for("update");
     const deleted = await tx
       .select({ id: agents.id, name: agents.name })
       .from(agents)
-      .where(and(eq(agents.ownerId, ownerId), inArray(agents.id, agentIds)))
+      .where(and(eq(agents.ownerId, ownerId), eq(agents.workspaceId, workspaceId), inArray(agents.id, agentIds)))
       .for("update");
     const ids = deleted.map((a) => a.id);
     if (ids.length === 0) return [];
@@ -1190,7 +1193,7 @@ export class Engine {
     for (const a of deleted) await tx.update(runs).set({ agentName: a.name }).where(eq(runs.agentId, a.id));
     // Their Jobs stay, their link cleared (`runs.agent_id` sets null).
     await tx.delete(agents).where(inArray(agents.id, ids));
-    out.push(...(await this.endConsults(tx, ownerId, ids)));
+    out.push(...(await this.endConsults(tx, workspaceId, ids)));
     spanEvent("engine.agents.deleted", { "dispand.agents.count": ids.length, "dispand.jobs.count": going.length });
     return out;
   }
@@ -1297,13 +1300,14 @@ export class Engine {
   private async openWaitingConsults(runIds: string[]) {
     if (runIds.length === 0) return;
     const waiting = await this.db
-      .select({ id: questions.id, ownerId: questions.ownerId })
+      .select({ id: questions.id, workspaceId: runs.workspaceId })
       .from(questions)
+      .innerJoin(runs, eq(runs.id, questions.runId))
       .where(and(inArray(questions.runId, runIds), eq(questions.kind, "consult"), eq(questions.status, "pending"), isNull(questions.consultRunId)));
-    for (const { id, ownerId } of waiting) {
+    for (const { id, workspaceId } of waiting) {
       const out: Out[] = [];
       await this.db.transaction(async (tx) => {
-        await lockConsults(tx, ownerId);
+        await lockConsults(tx, workspaceId);
         const [q] = await tx.select().from(questions).where(and(eq(questions.id, id), eq(questions.status, "pending"), isNull(questions.consultRunId))).for("update");
         if (q) await this.openConsult(tx, q, out);
       });
@@ -1398,8 +1402,8 @@ export class Engine {
       // A consult makes a Job in the asking Job's root: that root is locked first, as a
       // checkpoint's answer locks it before the runs and steps it stops.
       if (event.type === "question" && event.payload.kind === "consult") {
-        const [asking] = await tx.select({ ownerId: stepRuns.ownerId }).from(stepRuns).where(eq(stepRuns.sessionId, sessionId));
-        if (asking) await lockConsults(tx, asking.ownerId);
+        const [asking] = await tx.select({ workspaceId: runs.workspaceId }).from(stepRuns).innerJoin(runs, eq(runs.id, stepRuns.runId)).where(eq(stepRuns.sessionId, sessionId));
+        if (asking) await lockConsults(tx, asking.workspaceId);
         await tx
           .select({ id: roots.id })
           .from(stepRuns)
@@ -1957,7 +1961,7 @@ export class Engine {
           if (row.kind !== "consult") await recordInteraction(tx, row, "created");
           // A request for approval that names a proposal of this run: the question is for that proposal.
           if (event.payload.kind === "permission" && event.payload.toolName === REQUEST_APPROVAL) {
-            row.proposalId = await attachProposal(tx as unknown as Db, { runId: step.runId, ownerId: step.ownerId }, row.id, event.payload.input);
+            row.proposalId = await attachProposal(tx as unknown as Db, step.runId, row.id, event.payload.input);
             if (row.proposalId) await tx.update(questions).set({ proposalId: row.proposalId }).where(eq(questions.id, row.id));
           }
           out.push({ type: "question", question: questionView(row) });
