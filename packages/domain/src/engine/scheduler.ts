@@ -1,5 +1,6 @@
 import { and, asc, count, desc, eq, gt, inArray, isNull, lte, max, ne, notInArray, or } from "drizzle-orm";
 import type { Db, Tx } from "../db/client.ts";
+import { inRunScope } from "../db/scope.ts";
 import {
   agents,
   eventFires,
@@ -216,7 +217,8 @@ export class Scheduler {
     await this.engine.announceCheckpoints();
     for (const runId of [...this.stalled, ...started]) {
       try {
-        await this.engine.continueRun(runId);
+        // In the run's own scope, not the tick's (`inRunScope`).
+        await inRunScope(this.db, runId, () => this.engine.continueRun(runId));
         this.stalled.delete(runId);
       } catch (err) {
         // Left as is, the run would stay `running` with nothing started, and every later fire skipped.
