@@ -14,7 +14,8 @@ import { router } from "../rpc/router.ts";
 import { handleRunnerAttachment } from "../runners/attachments.ts";
 import type { RunnerHub } from "../runners/hub.ts";
 import { createRunner, pair } from "../runners/pairing.ts";
-import { ownerContext } from "../runners/test-support.ts";
+import { ownerContext, recordScopes } from "../runners/test-support.ts";
+import { inScope, SYSTEM } from "../db/scope.ts";
 import { MAX_FILE_BYTES, MAX_JOB_BYTES, sweepAttachments } from "./files.ts";
 
 // The smallest valid PNG header: signature, then the IHDR chunk's start.
@@ -71,7 +72,7 @@ test("a file attached before the first message is held for the person, then reac
 test("a CLI message carries generated paths: a file named .mcp.json, CLAUDE.md or AGENTS.md keeps its name only as words", async () => {
   const s = await setup();
   const runId = await started(s);
-  const ids = [];
+  const ids: string[] = [];
   for (const name of [".mcp.json", "CLAUDE.md", "AGENTS.md"]) ids.push((await s.hold(name, Buffer.from(`{"x": "${name}"}`))).id);
   await call(router.runs.sendChat, { runId, text: "Read these", attachmentIds: ids }, { context: s.context });
   await vi.waitFor(() => expect(s.sent.some((m) => m.type === "session.send")).toBe(true));
@@ -90,6 +91,11 @@ test("a CLI message carries generated paths: a file named .mcp.json, CLAUDE.md o
   const res = await fetch(ids[1]!, s.token);
   expect(res.status).toBe(200);
   expect(await res.text()).toBe('{"x": "CLAUDE.md"}');
+  // On the guarded db, from inside another scope: the token lookup under SYSTEM, the rest in the runner's workspace.
+  const recorder = await recordScopes(s.context.db);
+  const scoped = await inScope({ workspaceId: "ws_other" }, () => handleRunnerAttachment(new Request(`https://dispand.test/runner/attachments/${ids[1]}`, { headers: { authorization: `Bearer ${s.token}` } }), { ...s.context, db: recorder.db }, ids[1]!));
+  expect(scoped.status).toBe(200);
+  expect(recorder.statements.map((st) => st.scope)).toEqual([SYSTEM, ...recorder.statements.slice(1).map(() => ({ organizationId: s.context.organizationId, workspaceId: s.context.workspaceId }))]);
   const other = await createRunnerWithToken(s.context);
   expect((await fetch(ids[1]!, other.token)).status).toBe(404);
   expect((await fetch(ids[1]!, "rt_wrong")).status).toBe(401);
