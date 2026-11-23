@@ -265,7 +265,8 @@ export class Engine {
       const [trigger] = await tx
         .select({ agentId: triggers.agentId })
         .from(triggers)
-        .where(and(eq(triggers.id, triggerId), eq(triggers.ownerId, ownerId)));
+        // Its caller checked the trigger is of a workspace the person may start it in; the Job is theirs.
+        .where(eq(triggers.id, triggerId));
       if (!trigger) throw new EngineError("NOT_FOUND", message("triggers.notFound"));
       const id = await this.createJob(tx, { ownerId, agentId: trigger.agentId, triggerId, cause: { kind: "user", depth: 0 }, firing: { type: "manual", ...(timezone ? { timezone } : {}) } });
       if (skillId) {
@@ -1210,7 +1211,7 @@ export class Engine {
    * go with them, and each consult in flight that loses its entry ends with the reason
    * (`endConsults`). What it returns goes once `tx` commits (`settled`).
    */
-  async deleteAgents(tx: Tx, ownerId: string, workspaceId: string, agentIds: string[]): Promise<Out[]> {
+  async deleteAgents(tx: Tx, workspaceId: string, agentIds: string[]): Promise<Out[]> {
     if (agentIds.length === 0) return [];
     // First, as for any change of an agent's consults: a consult opened meanwhile is either seen by `endConsults` or sees this change.
     await lockConsults(tx, workspaceId);
@@ -1218,7 +1219,7 @@ export class Engine {
     const deleted = await tx
       .select({ id: agents.id, name: agents.name })
       .from(agents)
-      .where(and(eq(agents.ownerId, ownerId), eq(agents.workspaceId, workspaceId), inArray(agents.id, agentIds)))
+      .where(and(eq(agents.workspaceId, workspaceId), inArray(agents.id, agentIds)))
       .for("update");
     const ids = deleted.map((a) => a.id);
     if (ids.length === 0) return [];
