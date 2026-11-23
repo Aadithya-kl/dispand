@@ -228,7 +228,7 @@ async function updateRunnerTool(context: Pick<InitialContext, "db" | "hub" | "en
   if (!row) throw new ORPCError("NOT_FOUND", message("tools.notFound"));
   if (moved) {
     await askAgain(context.db, row.id);
-    await context.engine.narrowOwnerSessions(context.ownerId, context.db);
+    await context.engine.narrowWorkspaceSessions(await requireLegacyWorkspace(context), context.db);
   }
   return view(context.db, moved ? await refreshRunnerActions(context.db, context.hub, row) : row);
 }
@@ -298,7 +298,7 @@ const update = owner
     if (!row) throw context.expectField ? new ORPCError("CONFLICT", message("triggers.fieldChanged")) : new ORPCError("NOT_FOUND", message("tools.notFound"));
     if (moved) {
       await askAgain(context.db, row.id);
-      await context.engine.narrowOwnerSessions(context.ownerId, context.db);
+      await context.engine.narrowWorkspaceSessions(await requireLegacyWorkspace(context), context.db);
     }
     const changed = moved || (input.headers !== undefined && Object.keys(input.headers).length > 0) || row.auth !== current.auth;
     // An OAuth tool lists its actions once connected.
@@ -356,7 +356,7 @@ const authorize = owner
 const refresh = owner.input(z.object({ id: z.string() })).handler(async ({ input, context }) => {
   const row = await refreshAny(context, await find(context.db, context.ownerId, input.id));
   // Under strict permissions a new listing (or a failed one) can end grants: running sessions lose them too.
-  if (await strictPermissionsOf(context.db, await requireLegacyWorkspace(context))) await context.engine.narrowOwnerSessions(context.ownerId, context.db);
+  if (await strictPermissionsOf(context.db, await requireLegacyWorkspace(context))) await context.engine.narrowWorkspaceSessions(await requireLegacyWorkspace(context), context.db);
   return view(context.db, row);
 });
 
@@ -389,9 +389,8 @@ const get = owner.input(z.object({ id: z.string() })).handler(async ({ input, co
 
 /** Each action of a tool with whether a poll may read it, and why not. */
 const pollable = owner.input(z.object({ id: z.string() })).handler(async ({ input, context }) => {
-  const actions = await pollableActions(context.db, context.ownerId, input.id);
-  if (!actions) throw new ORPCError("NOT_FOUND", message("tools.notFound"));
-  return actions;
+  const row = await find(context.db, context.ownerId, input.id);
+  return (await pollableActions(context.db, row.workspaceId, row.id))!;
 });
 
 /** Sets the actions polls may read (the owner's choice; an action an agent asks before using stays unpolled). */
@@ -402,7 +401,7 @@ const setPollable = owner.input(z.object({ id: z.string(), actions: z.array(z.st
   if (unknown !== undefined) throw new ORPCError("BAD_REQUEST", message("tools.noAction", { action: unknown.slice(0, 100) }));
   await context.db.update(toolsTable).set({ pollable: [...new Set(input.actions)] }).where(eq(toolsTable.id, row.id));
   // Found above, so it lists the actions.
-  return (await pollableActions(context.db, context.ownerId, row.id))!;
+  return (await pollableActions(context.db, row.workspaceId, row.id))!;
 });
 
 /** Global availability is an owner's choice, independent of each agent's saved permissions. */
@@ -416,7 +415,7 @@ const setActionEnabled = owner.input(z.object({ toolId: z.string(), action: z.st
     const [updated] = await tx.update(toolsTable).set({ disabled, permissionRevision: sql`${toolsTable.permissionRevision} + 1` }).where(eq(toolsTable.id, tool.id)).returning();
     return updated!;
   });
-  if (!input.enabled) await context.engine.narrowOwnerSessions(context.ownerId, context.db);
+  if (!input.enabled) await context.engine.narrowWorkspaceSessions(await requireLegacyWorkspace(context), context.db);
   return view(context.db, row);
 });
 

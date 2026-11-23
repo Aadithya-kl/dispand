@@ -346,7 +346,7 @@ test("an action can be off, ask, or run; re-enabling an off read-only action ask
   await change("off");
   expect(await read()).toBe("off");
   const { rememberAllowedAction } = await import("./tool-ask.ts");
-  expect(await rememberAllowedAction(context.db, context.ownerId, { agentId: agent.id, toolId: "tool_gh", action: "read" })).toBe(false);
+  expect(await rememberAllowedAction(context.db, context.workspaceId, { agentId: agent.id, toolId: "tool_gh", action: "read" })).toBe(false);
   expect(await read()).toBe("off");
   await change("ask");
   expect(await read()).toBe("ask");
