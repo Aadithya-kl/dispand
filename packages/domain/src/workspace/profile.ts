@@ -1,9 +1,12 @@
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { withIdentity } from "../auth.ts";
-import { recordAudit } from "../audit/record.ts";
+import { recordAuditAfter } from "../audit/record.ts";
+import type { Db } from "../db/client.ts";
+import { currentScope, eachScope, SYSTEM } from "../db/scope.ts";
 import { user } from "../db/schema.ts";
 import { StorableText } from "../text.ts";
+import { mine } from "./authorize.ts";
 import { person } from "./people.ts";
 
 /** What the person knows and can answer, at most 1,000 characters (the column's check says the same). Empty clears it. */
@@ -17,10 +20,18 @@ export const get = person.handler(async ({ context }) => {
 export const update = person.input(z.object({ description: Description })).handler(async ({ context, input }) => {
   const description = input.description || null;
   const userId = context.ownerId;
-  // Better Auth's table is written through authDb; the audit row, with no text, in db.
+  // Better Auth's table is written through authDb; the audit rows, with no text, in db once it is saved.
   await withIdentity(context, async (tx) => {
     await tx.update(user).set({ description }).where(eq(user.id, userId));
-  }, (tx) => recordAudit(tx, { ownerId: userId, actor: { type: "user", userId }, action: "profile.updated", resource: { type: "user", id: userId } }));
+  }, async () => {});
+  // A profile is the person's, not a workspace's: each workspace they can open gets its row, written
+  // in that workspace's scope (`eachScope`); once, as is, on a single-tenant database, for them all.
+  const openable = async (db: Db) => (await mine(db, userId)).map(({ organizationId, workspaceId }) => ({ userId, organizationId, workspaceId }));
+  await eachScope(context.db, openable, async () => {
+    const pass = currentScope();
+    const workspaceIds = pass && pass !== SYSTEM && pass.workspaceId ? [pass.workspaceId] : (await openable(context.db)).map((w) => w.workspaceId);
+    for (const workspaceId of workspaceIds) await recordAuditAfter(context.db, { workspaceId, ownerId: userId, actor: { type: "user", userId }, action: "profile.updated", resource: { type: "user", id: userId } });
+  });
   return { description };
 });
 
