@@ -44,10 +44,10 @@ function done<T extends { id: string }>(result: T | Refusal): T {
 }
 
 /** Each agent author's name, for the page (an agent deleted since has none). */
-async function authorNames(db: Parameters<typeof scopeExists>[0], ownerId: string, authors: MemoryAuthor[]) {
+async function authorNames(db: Parameters<typeof scopeExists>[0], workspaceId: string, authors: MemoryAuthor[]) {
   const ids = [...new Set(authors.flatMap((a) => (a.type === "agent" ? [a.agentId] : [])))];
   if (ids.length === 0) return new Map<string, { name: string; builtIn: "assistant" | null }>();
-  const rows = await db.select({ id: agents.id, name: agents.name, builtIn: agents.builtIn }).from(agents).where(and(eq(agents.ownerId, ownerId), inArray(agents.id, ids)));
+  const rows = await db.select({ id: agents.id, name: agents.name, builtIn: agents.builtIn }).from(agents).where(and(eq(agents.workspaceId, workspaceId), inArray(agents.id, ids)));
   return new Map(rows.map((r) => [r.id, { name: r.name, builtIn: r.builtIn }]));
 }
 
@@ -57,19 +57,20 @@ const authorView = (a: MemoryAuthor, names: Map<string, { name: string; builtIn:
 /** A scope's index, its live entries and its removed ones. */
 const list = owner.input(Scope).handler(async ({ input, context }) => {
   const where = input as MemoryScope;
-  if (!(await scopeExists(context.db, context.ownerId, where))) throw new ORPCError("NOT_FOUND", message("memory.notFound"));
+  const workspaceId = await requireLegacyWorkspace(context);
+  if (!(await scopeExists(context.db, workspaceId, where))) throw new ORPCError("NOT_FOUND", message("memory.notFound"));
   const rows = await context.db
     .select()
     .from(memories)
     .where(
       and(
-        eq(memories.ownerId, context.ownerId),
+        eq(memories.workspaceId, workspaceId),
         eq(memories.scope, where.scope),
         where.scope === "table" ? eq(memories.tableId, where.tableId) : where.scope === "agent" ? eq(memories.agentId, where.agentId) : undefined,
       ),
     )
     .orderBy(asc(memories.path));
-  const names = await authorNames(context.db, context.ownerId, rows.map((r) => r.author));
+  const names = await authorNames(context.db, workspaceId, rows.map((r) => r.author));
   const view = rows.map((r) => ({
     id: r.id,
     path: r.path,
@@ -91,12 +92,12 @@ const write = owner
   .input(z.object({ where: Scope, entry: Entry }))
   .handler(async ({ input, context }) => done(await writeMemory(context.db, context.ownerId, await requireLegacyWorkspace(context), input.where as MemoryScope, input.entry, PERSON, "upsert")));
 
-const remove = owner.input(z.object({ id: ID })).handler(async ({ input, context }) => done(await removeMemoryById(context.db, context.ownerId, input.id, PERSON)));
+const remove = owner.input(z.object({ id: ID })).handler(async ({ input, context }) => done(await removeMemoryById(context.db, context.ownerId, await requireLegacyWorkspace(context), input.id, PERSON)));
 
-const accept = owner.input(z.object({ id: ID })).handler(async ({ input, context }) => done(await acceptMemory(context.db, context.ownerId, input.id)));
+const accept = owner.input(z.object({ id: ID })).handler(async ({ input, context }) => done(await acceptMemory(context.db, context.ownerId, await requireLegacyWorkspace(context), input.id)));
 
-const revert = owner.input(z.object({ id: ID })).handler(async ({ input, context }) => done(await revertMemory(context.db, context.ownerId, input.id)));
+const revert = owner.input(z.object({ id: ID })).handler(async ({ input, context }) => done(await revertMemory(context.db, context.ownerId, await requireLegacyWorkspace(context), input.id)));
 
-const restore = owner.input(z.object({ id: ID })).handler(async ({ input, context }) => done(await restoreMemory(context.db, context.ownerId, input.id)));
+const restore = owner.input(z.object({ id: ID })).handler(async ({ input, context }) => done(await restoreMemory(context.db, context.ownerId, await requireLegacyWorkspace(context), input.id)));
 
 export const memoriesRouter = { list, write, remove, accept, revert, restore };
