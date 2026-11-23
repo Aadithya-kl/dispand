@@ -17,22 +17,22 @@ const files = (dir: string): string[] =>
         : [],
   );
 
-const entries = ["server.ts", "vite-plugin-hub.ts", "src/server.ts"];
+const entries = ["vite-plugin-hub.ts", "src/server.ts"];
 
 test("the upgrade entries only hand the raw request to the guarded entry", () => {
   for (const file of entries) {
     const text = read(file);
     expect(text, file).not.toMatch(/req\.url|new URL\(req|socket\.\w+|handleUpgrade\(/);
   }
-  expect(read("server.ts")).toMatch(
-    /\.on\("upgrade", \(req: IncomingMessage, socket: Duplex, head: Buffer\) =>\s*built\.handleRunnerUpgrade\(req, socket, head\),?\s*\);/,
+  expect(read("src/server.ts")).toMatch(
+    /\.on\("upgrade", \(req: IncomingMessage, socket: Duplex, head: Buffer\) =>\s*handleRunnerUpgrade\(req, socket, head\),?\s*\);/,
   );
   expect(read("src/server.ts")).toMatch(/\{\s*upgradeRunner\(req, socket, head, [^\n]*\);\s*\}/);
   expect(read("vite-plugin-hub.ts")).toMatch(/if \(isRunnerUpgrade\(req\)\)\s*upgradeRunner\(req, socket, head, /);
 });
 
 test("no other web file handles upgrades", () => {
-  const others = [...files("src"), "vite.config.ts"]
+  const others = [...files("src"), "server.ts", "vite.config.ts"]
     .filter((file) => !entries.includes(file))
     .filter((file) => /"upgrade"|handleUpgrade\(|upgradeRunner\(/.test(read(file)));
   expect(others.map((file) => relative(root, join(root, file)))).toEqual([]);
