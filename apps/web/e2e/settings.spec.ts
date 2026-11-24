@@ -36,7 +36,8 @@ test("an owner revokes an invitation, then hands off a fresh link and sees the r
   await signIn(page);
   await page.getByRole("navigation", { name: "Main" }).getByRole("link", { name: "People" }).click();
   await expect(page.getByRole("heading", { name: "People", exact: true })).toBeVisible();
-  const person = page.getByRole("main").getByRole("listitem").filter({ hasText: "ada@example.com" });
+  // The workspace's directory comes first; the organization's members list Ada again below it.
+  const person = page.getByRole("main").getByRole("listitem").filter({ hasText: "ada@example.com" }).first();
   await expect(person).toContainText("Organization owner");
   await expect(person.getByRole("button")).toHaveCount(0);
   await page.getByRole("button", { name: "Invite person" }).click();
@@ -326,4 +327,12 @@ test("the organization's owner deletes a teammate, finds them under Deleted peop
   await deleted.getByRole("button", { name: "Restore Invited teammate" }).click();
   await expect(page.getByText("Invited teammate restored.")).toBeVisible();
   await expect(deleted.getByText("No deleted people.")).toBeVisible();
+  // Restored with no workspace role: found under Organization members, and given one there.
+  const members = page.getByRole("region", { name: "Organization members" });
+  const teammate = members.getByRole("listitem").filter({ hasText: "teammate@example.com" }).first();
+  await expect(teammate).toContainText("No role in any workspace yet.");
+  await members.screenshot({ path: test.info().outputPath("organization-members-light.png"), animations: "disabled" });
+  await teammate.getByRole("button", { name: "Add Invited teammate to the workspace" }).click();
+  await expect(page.getByText(/Invited teammate added to/)).toBeVisible();
+  await expect(teammate).toContainText("Workspace member");
 });

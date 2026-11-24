@@ -7,6 +7,7 @@ import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle, Dia
 import { PageHeader } from "../components/Placeholder.tsx";
 import { DataRetention } from "../components/settings/DataRetention.tsx";
 import { DeletedPeople } from "../components/settings/DeletedPeople.tsx";
+import { OrganizationPeople } from "../components/settings/OrganizationPeople.tsx";
 import { WorkspaceInvitations } from "../components/settings/WorkspaceInvitations.tsx";
 import { List } from "../components/settings/parts.tsx";
 import { orpc, type api } from "../lib/api.ts";
@@ -29,7 +30,17 @@ function People() {
       : scope ? <WorkspacePeople key={scope.workspaceId} scope={scope} />
       : <p>{t("people.unavailable")}</p>}
     {/* The people the organization deleted, and its data retention: its owner's only. */}
-    {current?.role === "owner" && <><DeletedPeople key={`deleted-${current.organizationId}`} /><DataRetention key={current.organizationId} /></>}
+    {current?.role === "owner" && <OwnerSections key={current.organizationId} />}
+  </>;
+}
+
+/** What only the organization's owner manages: all its people, those it deleted, and its data retention. */
+function OwnerSections() {
+  const retention = useQuery(orpc.organization.retention.queryOptions());
+  return <>
+    {retention.data && <OrganizationPeople retentionDays={retention.data.personDays} />}
+    <DeletedPeople />
+    <DataRetention />
   </>;
 }
 
@@ -50,18 +61,7 @@ function Directory({ scope }: { scope: Scope }) {
       await Promise.all([
         client.invalidateQueries({ queryKey: orpc.workspace.people.queryKey({ input: scope }) }),
         client.invalidateQueries({ queryKey: orpc.workspace.managed.key() }),
-      ]);
-    },
-  }));
-  // The organization's owner also deletes people from the organization (archived until the purge).
-  const { current } = useWorkspaces();
-  const owner = current?.role === "owner";
-  const retention = useQuery({ ...orpc.organization.retention.queryOptions(), enabled: owner });
-  const archive = useMutation(orpc.organization.archiveMember.mutationOptions({
-    onSuccess: async () => {
-      await Promise.all([
-        client.invalidateQueries({ queryKey: orpc.workspace.people.queryKey({ input: scope }) }),
-        client.invalidateQueries({ queryKey: orpc.organization.archived.key() }),
+        client.invalidateQueries({ queryKey: orpc.organization.directory.key() }),
       ]);
     },
   }));
@@ -69,31 +69,21 @@ function Directory({ scope }: { scope: Scope }) {
   if (people.isError || people.fetchStatus === "paused") return <p role="alert">{t("people.loadFailed")}</p>;
   if (!people.data || !people.isFetchedAfterMount) return <p role="status">{t("loading")}</p>;
 
-  const deleting = owner && retention.data ? { days: retention.data.personDays, onDelete: (person: Person) => {
-    setName(person.name);
-    remove.reset();
-    archive.mutate({ userId: person.userId });
-  } } : undefined;
   return <>
-    <PeopleList people={people.data} busy={remove.isPending || archive.isPending} focusStatus={() => status.current?.focus()} deleting={deleting} onRemove={(person) => {
+    <PeopleList people={people.data} busy={remove.isPending} focusStatus={() => status.current?.focus()} onRemove={(person) => {
       setName(person.name);
-      archive.reset();
       remove.mutate({ ...scope, userId: person.userId });
     }} />
     {remove.isError && <p role="alert" className="mt-3 text-sm text-danger">{t("people.removeFailed")}</p>}
-    {archive.isError && <p role="alert" className="mt-3 text-sm text-danger">{archive.error.message}</p>}
     <p ref={status} tabIndex={-1} role="status" className="mt-3 text-sm text-muted">
-      {remove.isPending ? t("people.removing", { name }) : remove.isSuccess ? t("people.removed", { name })
-        : archive.isPending ? t("people.deleting", { name }) : archive.isSuccess && t("people.deleted", { name })}
+      {remove.isPending ? t("people.removing", { name }) : remove.isSuccess && t("people.removed", { name })}
     </p>
   </>;
 }
 
 type Person = Awaited<ReturnType<typeof api.workspace.people>>[number];
 
-type Deleting = { days: number; onDelete: (person: Person) => void };
-
-function PeopleList({ people, busy, focusStatus, onRemove, deleting }: { people: Person[]; busy: boolean; focusStatus: () => void; onRemove: (person: Person) => void; deleting?: Deleting }) {
+function PeopleList({ people, busy, focusStatus, onRemove }: { people: Person[]; busy: boolean; focusStatus: () => void; onRemove: (person: Person) => void }) {
   const { t } = useTranslation(["settings", "common"]);
   const submitted = useRef(false);
   const [selected, setSelected] = useState<string>();
@@ -124,29 +114,6 @@ function PeopleList({ people, busy, focusStatus, onRemove, deleting }: { people:
                 <div className="flex justify-end gap-2">
                   <DialogClose asChild><Button variant="outline">{t("common:actions.cancel")}</Button></DialogClose>
                   <Button variant="destructive" onClick={() => { submitted.current = true; setSelected(undefined); onRemove(person); }}>{t("people.remove")}</Button>
-                </div>
-              </DialogContent>
-            </Dialog>
-          )}
-          {person.role !== "owner" && deleting && (
-            <Dialog open={selected === `delete:${person.userId}`} onOpenChange={(open) => {
-              if (!open || !busy) setSelected(open ? `delete:${person.userId}` : undefined);
-            }}>
-              <DialogTrigger asChild>
-                <Button size="sm" variant="outline" aria-disabled={busy} aria-label={t("people.deletePerson", { name: person.name })}>{t("people.delete")}</Button>
-              </DialogTrigger>
-              <DialogContent onCloseAutoFocus={(event) => {
-                if (submitted.current) {
-                  event.preventDefault();
-                  submitted.current = false;
-                  focusStatus();
-                }
-              }}>
-                <DialogTitle>{t("people.deleteConfirm", { name: person.name })}</DialogTitle>
-                <DialogDescription>{t("people.deleteEffect", { email: person.email, days: deleting.days })}</DialogDescription>
-                <div className="flex justify-end gap-2">
-                  <DialogClose asChild><Button variant="outline">{t("common:actions.cancel")}</Button></DialogClose>
-                  <Button variant="destructive" onClick={() => { submitted.current = true; setSelected(undefined); deleting.onDelete(person); }}>{t("people.delete")}</Button>
                 </div>
               </DialogContent>
             </Dialog>
