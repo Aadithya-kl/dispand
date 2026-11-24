@@ -862,6 +862,34 @@
       "when": 1795547683809,
       "tag": "0122_org_audit_retention",
       "breakpoints": true
+    },
+    {
+      "idx": 123,
+      "version": "7",
+      "when": 1795560160139,
+      "tag": "0123_subscription_enrollments",
+      "breakpoints": true
+    },
+    {
+      "idx": 124,
+      "version": "7",
+      "when": 1795560916831,
+      "tag": "0124_personal_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 125,
+      "version": "7",
+      "when": 1795561256461,
+      "tag": "0125_personal_consent",
+      "breakpoints": true
+    },
+    {
+      "idx": 126,
+      "version": "7",
+      "when": 1795561681923,
+      "tag": "0126_enrollment_sign_in",
+      "breakpoints": true
     }
   ]
 }

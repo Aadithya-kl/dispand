@@ -1,4 +1,5 @@
 import type { chatQueue, messages, questions, runs, stepRuns } from "../db/schema.ts";
+import type { Paused } from "../runners/grants.ts";
 import { deletedAgent } from "../jobs/agent-name.ts";
 import { steering } from "./harness.ts";
 import type { WorkflowDef } from "../workflows/model.ts";
@@ -26,10 +27,29 @@ export function runView(r: RunRow, def: WorkflowDef | null = r.def) {
   const chatNode = continuationNode(r, def);
   return { ...(chatNode ? { continuationNodeId: chatNode } : {}), id, source, workflowId, version, agentId, deletedAgentName, triggerId, status, trigger, error, createdAt, finishedAt };
 }
+/** A step not ended yet: only then can it, or its answers, wait for consent or recovery. */
+const going = (s: Pick<StepRow, "status">) => s.status === "pending" || s.status === "running" || s.status === "waiting";
+
+/** Why a personal action waits (`runners/grants.ts`), while it isn't ended, holds no slot and isn't queued for one. */
+export function pausedFor(s: Pick<StepRow, "status" | "pendingAction" | "working" | "queuedAt">): Paused | undefined {
+  return going(s) && s.pendingAction?.paused && !s.working && !s.queuedAt ? s.pendingAction.paused : undefined;
+}
+
+/**
+ * Whether `userId` is the one to consent now to another person's answer to a personal action
+ * (`Engine.consent`): it awaits, undelivered, its step's subscriber, under the same enrollment.
+ */
+export function awaitsConsentOf(q: Pick<QuestionRow, "consent" | "deliveredAt" | "stepRunId">, step: Pick<StepRow, "status" | "placement"> | null | undefined, userId: string): boolean {
+  const placement = step?.placement;
+  return q.consent?.state === "awaiting" && !q.deliveredAt && !!q.stepRunId && !!step && going(step) && placement?.kind === "personal" && placement.actorId === userId && placement.enrollmentId === q.consent.enrollmentId;
+}
+
 export function stepView(s: StepRow) {
   const { id, runId, nodeId, iteration, status, outputs, error, startedAt, finishedAt, queuedAt, turnStatus, turnId, interruptible } = s;
   // prompt: as the step got it, values filled in (for the owner to debug a run); null until started.
-  return { id, runId, nodeId, iteration, status, outputs, error, startedAt, finishedAt, queuedAt, turnStatus, turnId, interruptible, interactive: s.start?.interactive ?? false, prompt: s.start?.prompt ?? null, ...(s.cliSessionId ? { resumable: true as const } : {}), ...(s.start?.interactive && s.harness ? { steering: steering(s.harness) } : {}) };
+  // `credential`: the kind of its placement only, never whose subscription.
+  const paused = pausedFor(s);
+  return { id, runId, nodeId, iteration, status, outputs, error, startedAt, finishedAt, queuedAt, turnStatus, turnId, interruptible, interactive: s.start?.interactive ?? false, prompt: s.start?.prompt ?? null, ...(s.placement ? { credential: s.placement.kind } : {}), ...(paused ? { paused } : {}), ...(s.cliSessionId ? { resumable: true as const } : {}), ...(s.start?.interactive && s.harness ? { steering: steering(s.harness) } : {}) };
 }
 export function messageView(m: MessageRow) {
   const { id, runId, stepRunId, role, text, createdAt, files, result } = m;
@@ -40,10 +60,15 @@ export function queuedView(q: QueuedRow) {
   const { id, runId, stepRunId, state, text, skillId, files, error, createdAt } = q;
   return { id, runId, stepRunId, state, text, skillId, error, createdAt, ...(files?.length ? { files } : {}) };
 }
-export function questionView(q: QuestionRow) {
+/**
+ * `step`: its step's row, when the reader has it. `recovery`: its answer is recorded but its personal
+ * action paused before taking it (`Engine.personalAnswer`), so it waits for that action's recovery.
+ */
+export function questionView(q: QuestionRow, step?: Pick<StepRow, "status" | "pendingAction" | "working" | "queuedAt"> | null) {
   // `rootId`: a checkpoint's Approval (`roots.ts`), told apart by it and never by its tool name.
   const { id, runId, stepRunId, placement, payload, status, answer, createdAt, about, proposalId, rootId } = q;
-  return { id, runId, stepRunId, placement, payload, status, answer, createdAt, about, proposalId, rootId, ...(q.route && q.addresseeId ? { escalation: { addresseeId: q.addresseeId, hop: q.route.hop } } : {}), ...(q.remember ? { remember: { scopes: q.remember.scopes, ...(q.remember.decisions ? { decisions: q.remember.decisions } : {}), label: q.remember.subject.kind === "cli" ? q.remember.subject.rule : about ? `${about.tool}: ${about.action}` : payload.kind === "permission" ? payload.toolName : "" } } : {}) };
+  const recovery = status === "answered" && !q.deliveredAt && !!step && pausedFor(step) !== undefined;
+  return { id, runId, stepRunId, placement, payload, status, answer, createdAt, about, proposalId, rootId, ...(recovery ? { recovery } : {}), ...(q.consent ? { consent: q.consent.state } : {}), ...(q.route && q.addresseeId ? { escalation: { addresseeId: q.addresseeId, hop: q.route.hop } } : {}), ...(q.remember ? { remember: { scopes: q.remember.scopes, ...(q.remember.decisions ? { decisions: q.remember.decisions } : {}), label: q.remember.subject.kind === "cli" ? q.remember.subject.rule : about ? `${about.tool}: ${about.action}` : payload.kind === "permission" ? payload.toolName : "" } } : {}) };
 }
 
 /** What `runs.stream` forwards: each carries the whole row as it is now (upserts by id). */

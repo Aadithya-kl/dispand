@@ -20,6 +20,7 @@ import type { PluginDefinitions, PrimitiveDefinition } from "../plugins/definiti
 import type { NotImported, PluginComponents } from "../plugins/read-plugin.ts";
 import type { OAuthStatus, ToolAction, ToolAuth, ToolTransport } from "../tools/mcp.ts";
 import type { AuditAction, AuditActor, AuditDetails, AuditResource, AuditResult } from "../audit/model.ts";
+import type { Paused } from "../runners/grants.ts";
 
 // Better Auth tables (email + password, one owner).
 export const user = pgTable("user", {
@@ -172,6 +173,48 @@ export const runnerPairings = pgTable("runner_pairings", {
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
+// A person's own CLI subscription on a runner (`runners/subscriptions.ts`): who enrolled it, where,
+// and the digest of the provider identity the runner signed in as. One per harness per runner.
+// Deleted when the binding ends; every reader checks the person's access and the runner again.
+export const subscriptionEnrollments = pgTable("subscription_enrollments", {
+  id: text("id").primaryKey(),
+  workspaceId: text("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  runnerId: text("runner_id").notNull().references(() => runners.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
+  harness: text("harness").$type<"claude-code" | "codex">().notNull(),
+  identity: text("identity").notNull(),
+  // The runner's last report: the login can no longer renew, its subscriber must sign in again there.
+  signInNeeded: boolean("sign_in_needed").notNull().default(false),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (t) => [unique().on(t.runnerId, t.harness)]);
+
+// A personal action's grant (`runners/grants.ts`): the step it runs, on whose enrollment, for whom,
+// until when. Deleted when it ends; an expired one is never renewed. The enrollment id is no foreign
+// key: a replacement enrollment must find nothing here.
+export const personalGrants = pgTable("personal_grants", {
+  id: text("id").primaryKey(),
+  workspaceId: text("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  stepRunId: text("step_run_id").notNull().references(() => stepRuns.id, { onDelete: "cascade" }),
+  runnerId: text("runner_id").notNull().references(() => runners.id, { onDelete: "cascade" }),
+  enrollmentId: text("enrollment_id").notNull(),
+  actorId: text("actor_id").notNull(),
+  expiresAt: timestamp("expires_at").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (t) => [index("personal_grants_step_idx").on(t.stepRunId)]);
+
+// A one-time enrollment challenge: started by the person in Dispand, typed on the signed-in runner.
+export const subscriptionChallenges = pgTable("subscription_challenges", {
+  id: text("id").primaryKey(),
+  workspaceId: text("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  runnerId: text("runner_id").notNull().references(() => runners.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull().references(() => user.id, { onDelete: "cascade" }),
+  // SHA-256 (hex) of the challenge.
+  codeHash: text("code_hash").notNull().unique(),
+  expiresAt: timestamp("expires_at").notNull(),
+  usedAt: timestamp("used_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
 // Harnesses: a CLI on a runner (`cli`), or a provider's API with a key (`cloud`).
 export const harnesses = pgTable("harnesses", {
   id: text("id").primaryKey(),
@@ -289,7 +332,9 @@ export type QueueClass = "person" | "resume" | "new";
  * What a step does once it holds a slot: its session's start, the answers and chat messages that
  * wait for it (`deliver`), or its lost session's resume, which carries those too.
  */
-export type PendingAction = { kind: "start" | "deliver" | "resume" };
+export type PendingAction = { kind: "start" | "deliver" | "resume"; paused?: Paused };
+/** A step's credential: the workspace's, or its actor's own subscription on its runner (`runners/grants.ts`). */
+export type Placement = { kind: "workspace" } | { kind: "personal"; enrollmentId: string; actorId: string };
 
 /** The agent as it was when its Job was created: the Job's sessions read it, not the `agents` row. */
 export type AgentSnapshot = {
@@ -580,6 +625,9 @@ export const stepRuns = pgTable(
     // What it does once it holds a slot: set when queued (or handed one), cleared when done;
     // `recover()` replays it for a step handed a slot before the process stopped.
     pendingAction: jsonb("pending_action").$type<PendingAction>(),
+    // Which credential its session runs on, chosen once when it is authorized (`runners/grants.ts`):
+    // null until then; a personal one keeps its actor and enrollment, checked again at each use.
+    placement: jsonb("placement").$type<Placement>(),
   },
   (t) => [
     unique().on(t.runId, t.nodeId, t.iteration),
@@ -772,6 +820,11 @@ export const proposals = pgTable(
  * Who answered a question: a person, or an agent's Job with the `inbox` bundle (under the name
  * the agent had then, as the asking Job is told it).
  */
+/**
+ * A personal action's subscriber continuing it after another person's answer: awaited for one answer
+ * under one enrollment, then given once by that subscriber (`Engine.consent`).
+ */
+export type Consent = { state: "awaiting"; enrollmentId: string } | { state: "given"; enrollmentId: string; userId: string; at: string };
 export type AnsweredBy = { type: "user"; userId: string } | { type: "agent"; agentId: string; runId: string; name: string } | { type: "nobody" };
 
 /**
@@ -836,6 +889,11 @@ export const questions = pgTable(
     route: jsonb("route").$type<Route>(),
     // When the current hop of a routed question lapses (`engine/routing.ts`, 72 h a hop): the sweep moves it on then.
     answerBy: timestamp("answer_by", { withTimezone: true }),
+    // A personal action's question (`runners/grants.ts`): the grant of the worker that asked it. Another
+    // person's answer goes only to that worker, while that grant still holds.
+    grantId: text("grant_id"),
+    // Another person's answer to a personal action, waiting for its subscriber, then their consent to continue.
+    consent: jsonb("consent").$type<Consent>(),
   },
   (t) => [
     unique().on(t.sessionId, t.runnerQuestionId),

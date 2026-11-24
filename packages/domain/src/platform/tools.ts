@@ -554,6 +554,10 @@ export const NOT_TOOLS: string[] = [
   "runners.installUpdate",
   "runners.workspacePlugin",
   "runners.workspaceSkills",
+  // A person's own subscription enrollment: theirs alone, never a Job's.
+  "runners.startEnrollment",
+  "runners.subscriptions",
+  "runners.endSubscription",
   "harnesses.create",
   "harnesses.update",
   "harnesses.delete",
@@ -640,6 +644,8 @@ export const NOT_TOOLS: string[] = [
   "questions.count",
   "questions.stream",
   "questions.answer",
+  // A subscriber's own consent to continue their personal action: a person's, never a Job's.
+  "questions.consent",
   // Audit: the owner's page for now (an agent's read comes with its tool); where traces are opened.
   "audit.traceUrl",
   "workspace.mine",
