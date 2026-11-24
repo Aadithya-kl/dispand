@@ -256,13 +256,25 @@ changes it updates this file.
   `agents.people` gives the members' names and whether each wrote a profile, never its text.
 - **A question outside a chat reaches one person the rules allow, read when it is asked.** A
   Job's question to a person outside a chat (`ask` to a person or to nobody, `ask_user`,
-  `AskUserQuestion`) goes through `firstHop` (`engine/routing.ts`): refused at once with a fixed
+  `AskUserQuestion`) goes through `firstHop` (`engine/routing.ts`): first to the person who
+  started the run by hand, or for a Job of a person's Stem (their Assistant, which acts for them)
+  to that person, while they are a member, whatever the mode (asking them isn't escalation); past them, or in a run no person started, refused at once with a fixed
   text when the agent's escalation is disabled now, whatever tool asked and whatever the Job's
   start listed; else the person `to` names only when the Job's start listed them and the mode
   still allows them, else the agent's creator (a workflow run's: the workflow's creator) while
   `authorize` admits them, else the organization's owner. A `to` that resolves to nobody is
   neither stored nor audited. In a chat, the person talking is asked, whatever the mode. Being
   addressed lets a person answer a question; it never grants a role an Approval needs.
+- **Every use of an escalation checks its addressee again, live, first.** Listing it in an Inbox,
+  answering it, and sending a push for it (each retry too) call `Engine.checkEscalation` in their
+  own transaction: the rule of its hop is read again (escalation still enabled, the addressee still
+  admitted by `authorize`, still picked or still the creator or the owner). When it fails, the
+  question moves to the next hop (`question.rerouted`), skipping whoever was asked already, or is
+  settled with a fixed text when escalation is now disabled or no hop is left
+  (`question.unanswered`); then the use goes on, so a removed member neither lists, answers nor is
+  notified of it. `engine/escalation-uses.test.ts` lists every such use and fails on a reader of a
+  question's addressee that isn't one of them or doesn't say why. A membership change committed
+  during a use applies from the next use: nothing locks against it.
 - **Long work waits for a person; it is never cut.** The Jobs from one root cause pause at the
   workspace's checkpoint, and only a person's answer to its Approval lets them go on: no tool
   answers a question, and every path that makes a session work again reads the root's state
