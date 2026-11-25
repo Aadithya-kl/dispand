@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { contentDigest } from "@dispand/runner-protocol/digest";
 import { afterEach, expect, test } from "vitest";
 import { unlock } from "../skills.ts";
-import { codexMarketplace, nativePluginFolders, nativePluginViews, sweepNativePlugins, withoutDecidingHooks, withoutGrantingFrontmatter, withoutServers, type FetchNative } from "./native-plugins.ts";
+import { codexMarketplace, nativePluginFolders, nativePluginViews, sweepNativePlugins, withClaudeVariables, withoutDecidingHooks, withoutGrantingFrontmatter, withoutServers, type FetchNative } from "./native-plugins.ts";
 
 const files = [{ path: ".claude-plugin/plugin.json", content: Buffer.from('{"name":"demo"}') }, { path: "hooks/hooks.json", content: Buffer.from("{}") }];
 const digest = contentDigest(files);
@@ -120,6 +120,7 @@ test("a declaration of a shape the filter doesn't read for sure is dropped whole
   // A root `plugin.json` a Claude plugin names as its server file, holding a bare map: filtered.
   const named = withoutServers([{ path: "skills/a/SKILL.md", content: Buffer.from("notes") }, { path: ".claude-plugin/plugin.json", content: json({ name: "demo", mcpServers: "./plugin.json" }) }, { path: "plugin.json", content: json({ notes: { command: "n" }, kept: { command: "k" } }) }], ["notes"]);
   expect(read(named, "plugin.json")).toEqual({ kept: { command: "k" } });
+  // The reference stays, as the path it resolves to, with the `./` both CLIs require.
   expect(read(named, ".claude-plugin/plugin.json")).toEqual({ name: "demo", mcpServers: "./plugin.json" });
   // A manifest with a byte-order mark is read as Claude Code reads it, and filtered.
   const bom = withoutServers([{ path: ".claude-plugin/plugin.json", content: Buffer.from(`\uFEFF${JSON.stringify({ name: "demo", mcpServers: { notes: { command: "n" }, kept: { command: "k" } } })}`) }], ["notes"]);
@@ -253,4 +254,76 @@ test("a manifest's skills, commands and agents stay only as paths; an inline one
   const read = (value: object) => JSON.parse(withoutGrantingFrontmatter([manifest(value)])[0]!.content.toString()) as Record<string, unknown>;
   expect(read({ name: "p", commands: ["./extra/ship.md"], agents: "./agents", skills: ["./skills"] })).toEqual({ name: "p", commands: ["./extra/ship.md"], agents: "./agents", skills: ["./skills"] });
   expect(read({ name: "p", commands: { ship: { source: "./ship.md", allowedTools: ["Write"] } }, agents: [{ name: "a", tools: ["Write"] }], skills: { s: { content: "---\nallowed-tools: Write\n---\n" } } })).toEqual({ name: "p" });
+});
+
+test("for Codex, the Claude variables in every server and hook declaration lead to the plugin's mount and the working folder", () => {
+  const values = { CLAUDE_PLUGIN_ROOT: "/run/plugins/plugin_a", CLAUDE_PROJECT_DIR: "/work/runs/r1" };
+  const server = { command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/server.mjs", "--project", "${CLAUDE_PROJECT_DIR}"], env: { ROOT: "$CLAUDE_PLUGIN_ROOT", DATA: "${CLAUDE_PLUGIN_DATA}" }, cwd: "${CLAUDE_PLUGIN_ROOT}" };
+  const hooks = { hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "$CLAUDE_PLUGIN_ROOT/hook.sh > $CLAUDE_PROJECT_DIR/out.txt" }] }] } };
+  const out = withClaudeVariables([
+    { path: ".mcp.json", content: json({ mcpServers: { a: server } }) },
+    { path: ".claude-plugin/plugin.json", content: json({ name: "demo", mcpServers: "./servers.json", hooks: "./more-hooks.json" }) },
+    { path: ".codex-plugin/plugin.json", content: json({ name: "demo", mcpServers: { b: server }, hooks: hooks.hooks }) },
+    { path: "servers.json", content: json({ mcpServers: { c: server } }) },
+    { path: "hooks/hooks.json", content: json(hooks) },
+    { path: "more-hooks.json", content: json(hooks) },
+    { path: "data/notes.json", content: json({ note: "${CLAUDE_PLUGIN_ROOT}" }) },
+    { path: "commands/run.md", content: Buffer.from("Run ${CLAUDE_PLUGIN_ROOT}/x") },
+  ], values);
+  const read = (path: string) => JSON.parse(out.find((f) => f.path === path)!.content.toString());
+  const expanded = { command: "node", args: ["/run/plugins/plugin_a/server.mjs", "--project", "/work/runs/r1"], env: { ROOT: "/run/plugins/plugin_a", DATA: "${CLAUDE_PLUGIN_DATA}" }, cwd: "/run/plugins/plugin_a" };
+  expect(read(".mcp.json").mcpServers.a).toEqual(expanded);
+  expect(read(".codex-plugin/plugin.json").mcpServers.b).toEqual(expanded);
+  expect(read("servers.json").mcpServers.c).toEqual(expanded);
+  const command = "/run/plugins/plugin_a/hook.sh > /work/runs/r1/out.txt";
+  for (const path of ["hooks/hooks.json", "more-hooks.json"]) expect(read(path).hooks.UserPromptSubmit[0].hooks[0].command).toBe(command);
+  expect(read(".codex-plugin/plugin.json").hooks.UserPromptSubmit[0].hooks[0].command).toBe(command);
+  // A manifest's references to its server and hook files stay as the filters read them.
+  const pointing = withClaudeVariables([{ path: ".codex-plugin/plugin.json", content: json({ name: "demo", mcpServers: "${CLAUDE_PLUGIN_ROOT}/other.json", hooks: ["${CLAUDE_PLUGIN_ROOT}/h.json"] }) }], values);
+  expect(JSON.parse(pointing[0]!.content.toString())).toEqual({ name: "demo", mcpServers: "${CLAUDE_PLUGIN_ROOT}/other.json", hooks: ["${CLAUDE_PLUGIN_ROOT}/h.json"] });
+  // Not a declaration: as it was. A longer name isn't one of these variables.
+  expect(read("data/notes.json").note).toBe("${CLAUDE_PLUGIN_ROOT}");
+  expect(out.find((f) => f.path === "commands/run.md")!.content.toString()).toBe("Run ${CLAUDE_PLUGIN_ROOT}/x");
+  expect(JSON.parse(withClaudeVariables([{ path: ".mcp.json", content: json({ mcpServers: { a: { command: "$CLAUDE_PLUGIN_ROOTS/x" } } }) }], values)[0]!.content.toString()).mcpServers.a.command).toBe("$CLAUDE_PLUGIN_ROOTS/x");
+});
+
+test("only Codex's view has the variables expanded; Claude Code expands them itself", async () => {
+  state = await mkdtemp(join(tmpdir(), "native-"));
+  const declared = [{ path: ".mcp.json", content: json({ mcpServers: { a: { command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/s.mjs"] } } }) }];
+  const d = contentDigest(declared);
+  const stored = await nativePluginFolders(state, [{ pluginId: "plugin_a", digest: d }], serve(declared).fetchFiles);
+  const views = join(state, "views");
+  const args = async (codex?: { cwd: string }) => {
+    const [view] = await nativePluginViews(views, stored, [{ pluginId: "plugin_a", digest: d }], codex);
+    return JSON.parse(await readFile(join(view!.dir, ".mcp.json"), "utf8")).mcpServers.a.args;
+  };
+  expect(await args()).toEqual(["${CLAUDE_PLUGIN_ROOT}/s.mjs"]);
+  expect(await args({ cwd: "/work/runs/r1" })).toEqual(["/run/plugins/plugin_a/s.mjs"]);
+  await unlock(views);
+});
+
+test("a manifest's file reference is resolved as the CLIs resolve it, and dropped when it doesn't lead to a filtered file", () => {
+  const servers = json({ mcpServers: { notes: { command: "n" }, kept: { command: "k" } } });
+  for (const ref of ["./servers.json/", "servers.json//", ".//servers.json", "./sub/../servers.json", "${CLAUDE_PLUGIN_ROOT}/servers.json"]) {
+    const out = withoutServers([{ path: ".codex-plugin/plugin.json", content: json({ name: "demo", mcpServers: ref }) }, { path: "servers.json", content: servers }], ["notes"]);
+    const read = (path: string) => JSON.parse(out.find((f) => f.path === path)!.content.toString());
+    expect(read(".codex-plugin/plugin.json").mcpServers, ref).toBe("./servers.json");
+    expect(Object.keys(read("servers.json").mcpServers), ref).toEqual(["kept"]);
+  }
+  // Leading out of the plugin, to nothing, or to a file the filter dropped: the reference goes.
+  for (const ref of ["../servers.json", "/servers.json", "missing.json", "./", "broken.json"]) {
+    const out = withoutServers([{ path: ".codex-plugin/plugin.json", content: json({ name: "demo", mcpServers: [ref] }) }, { path: "broken.json", content: Buffer.from("[1,") }], ["notes"]);
+    expect(JSON.parse(out.find((f) => f.path === ".codex-plugin/plugin.json")!.content.toString()), ref).toEqual({ name: "demo" });
+  }
+  // A list keeps only what resolves, as `./` paths.
+  const both = withoutServers([{ path: ".claude-plugin/plugin.json", content: json({ name: "demo", mcpServers: ["./servers.json/", "../elsewhere.json"] }) }, { path: "servers.json", content: servers }], ["notes"]);
+  expect(JSON.parse(both.find((f) => f.path === ".claude-plugin/plugin.json")!.content.toString()).mcpServers).toEqual(["./servers.json"]);
+});
+
+test("a hooks file reference resolves the same way; one to an unfiltered or missing file is dropped", () => {
+  const hooks = json({ hooks: { PreToolUse: [{ hooks: [{ type: "command", command: "allow" }] }], UserPromptSubmit: [{ hooks: [{ type: "command", command: "touch x" }] }] } });
+  const out = withoutDecidingHooks([{ path: ".codex-plugin/plugin.json", content: json({ name: "a", hooks: ["./more/hooks.json/", "nowhere.json"] }) }, { path: "more/hooks.json", content: hooks }]);
+  const read = (path: string) => JSON.parse(out.find((f) => f.path === path)!.content.toString());
+  expect(read(".codex-plugin/plugin.json").hooks).toEqual(["./more/hooks.json"]);
+  expect(Object.keys(read("more/hooks.json").hooks)).toEqual(["UserPromptSubmit"]);
 });

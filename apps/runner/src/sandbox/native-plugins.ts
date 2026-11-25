@@ -9,6 +9,7 @@ import { z } from "zod";
 import { checkFiles, PluginRefused, writeReadOnly } from "../plugin-servers.ts";
 import { parse, stringify } from "yaml";
 import { FRONTMATTER, readCapped, unlock } from "../skills.ts";
+import { NATIVE_PLUGINS } from "./worker.ts";
 
 type Files = { path: string; content: Buffer }[];
 export type NativePluginRef = { pluginId: string; digest: string; managedServers?: string[] };
@@ -79,6 +80,42 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 /** A manifest's `mcpServers` naming server files only (a path, or a list of them). */
 const namesFiles = (v: unknown) => typeof v === "string" || (Array.isArray(v) && v.every((d) => typeof d === "string"));
 
+/**
+ * A manifest's file reference as a path from the plugin's root, resolved the way the CLIs do
+ * (`./`, `${CLAUDE_PLUGIN_ROOT}/`, duplicate and trailing slashes), or null when it leaves the
+ * plugin or names nothing.
+ */
+function reference(item: string): string | null {
+  const path = posix.normalize(item.replace(/^\$\{CLAUDE_PLUGIN_ROOT\}\//, "")).replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+  return path && path !== "." && path !== ".." && !path.startsWith("../") && !posix.isAbsolute(path) ? path : null;
+}
+
+/**
+ * The manifests with their references to `key`'s files (`mcpServers`, `hooks`) kept only where
+ * they lead to a file the filters read, written as `./<that path>`: a reference to anything else is
+ * dropped, so no CLI loads a declaration that wasn't filtered.
+ */
+function checkedReferences(out: Map<string, Buffer>, key: "mcpServers" | "hooks"): void {
+  for (const path of MANIFESTS) {
+    const content = out.get(path);
+    let manifest: unknown;
+    try {
+      manifest = content && JSON.parse(content.toString("utf8").replace(/^\uFEFF/, ""));
+    } catch {
+      continue;
+    }
+    if (!isObject(manifest) || !namesFiles(manifest[key])) continue;
+    const kept = [manifest[key]].flat().flatMap((item) => {
+      const found = reference(item as string);
+      // Written as both CLIs require a reference: from the plugin's root, with `./`.
+      return found && out.has(found) ? [`./${found}`] : [];
+    });
+    const next: Record<string, unknown> = { ...manifest, [key]: typeof manifest[key] === "string" ? kept[0] : kept };
+    if (!kept.length) delete next[key];
+    out.set(path, Buffer.from(JSON.stringify(next, null, 2)));
+  }
+}
+
 /** A map of server name to its declaration (an object), without `managed`; anything else: null. */
 function serverMap(value: unknown, managed: Set<string>): Record<string, unknown> | null {
   if (!isObject(value) || Object.values(value).some((v) => !isObject(v))) return null;
@@ -129,7 +166,7 @@ export function withoutServers(files: Files, managed: string[]): Files {
     if (!isObject(manifest) || !("mcpServers" in manifest)) continue;
     const declared = manifest.mcpServers;
     // Files it names, as paths from the plugin's root (`./servers.json`): filtered below.
-    for (const item of [declared].flat()) if (typeof item === "string") targets.add(posix.normalize(item).replace(/^\.\//, ""));
+    for (const item of [declared].flat()) if (typeof item === "string") { const found = reference(item); if (found) targets.add(found); }
     if (namesFiles(declared)) continue;
     const kept = serverFile(declared, names);
     const next: Record<string, unknown> = { ...manifest, mcpServers: kept };
@@ -147,6 +184,7 @@ export function withoutServers(files: Files, managed: string[]): Files {
     if (kept === null) out.delete(path);
     else out.set(path, Buffer.from(JSON.stringify(kept, null, 2)));
   }
+  checkedReferences(out, "mcpServers");
   return [...out].map(([path, content]) => ({ path, content }));
 }
 
@@ -192,7 +230,7 @@ export function withoutDecidingHooks(files: Files): Files {
     if (!isObject(manifest) || !("hooks" in manifest)) continue;
     const declared = manifest.hooks;
     if (namesFiles(declared)) {
-      for (const item of [declared].flat()) targets.add(posix.normalize(item as string).replace(/^\.\//, ""));
+      for (const item of [declared].flat()) { const found = reference(item as string); if (found) targets.add(found); }
       continue;
     }
     // Inline: the file's form or the event map itself.
@@ -211,6 +249,7 @@ export function withoutDecidingHooks(files: Files): Files {
     if (kept === null) out.delete(path);
     else out.set(path, Buffer.from(JSON.stringify(kept, null, 2)));
   }
+  checkedReferences(out, "hooks");
   return [...out].map(([path, content]) => ({ path, content }));
 }
 
@@ -257,6 +296,48 @@ export function withoutGrantingFrontmatter(files: Files): Files {
   });
 }
 
+/** The variables Claude Code expands in a plugin's server and hook declarations, and Codex doesn't. */
+const CLAUDE_VARIABLES = /\$\{(CLAUDE_PLUGIN_ROOT|CLAUDE_PROJECT_DIR)\}|\$(CLAUDE_PLUGIN_ROOT|CLAUDE_PROJECT_DIR)(?![A-Za-z0-9_])/g;
+
+/**
+ * For Codex (0.169 keeps them literal): the plugin with `${CLAUDE_PLUGIN_ROOT}` and
+ * `${CLAUDE_PROJECT_DIR}` (and their `$NAME` forms) replaced, in every string of the files that
+ * declare servers or hooks (`.mcp.json`, `mcp.json`, the hooks files, the manifests, and the files
+ * they name), by the plugin's read-only mount and the session's working folder. Others stay literal.
+ */
+export function withClaudeVariables(files: Files, values: { CLAUDE_PLUGIN_ROOT: string; CLAUDE_PROJECT_DIR: string }): Files {
+  const parsed = (content: Buffer): unknown => {
+    try {
+      return JSON.parse(content.toString("utf8").replace(/^\uFEFF/, ""));
+    } catch {
+      return undefined;
+    }
+  };
+  const targets = new Set([...SERVER_FILES, ...HOOK_FILES, ...MANIFESTS]);
+  for (const path of MANIFESTS) {
+    const manifest = files.find((f) => f.path === path);
+    const value = manifest && parsed(manifest.content);
+    if (!isObject(value)) continue;
+    for (const key of ["mcpServers", "hooks"]) if (namesFiles(value[key])) for (const item of [value[key]].flat()) { const found = reference(item as string); if (found) targets.add(found); }
+  }
+  const expand = (value: unknown): unknown =>
+    typeof value === "string" ? value.replace(CLAUDE_VARIABLES, (_, braced, bare) => values[(braced ?? bare) as keyof typeof values])
+    : Array.isArray(value) ? value.map(expand)
+    : isObject(value) ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, expand(v)]))
+    : value;
+  return files.map((f) => {
+    const value = targets.has(f.path) ? parsed(f.content) : undefined;
+    // Not JSON: left as it is (the filters before this one dropped what they couldn't read).
+    if (value === undefined) return f;
+    const next = expand(value);
+    // A manifest's references to server or hook files stay as they were: the filters read those
+    // files, and Codex must load the same ones.
+    if (MANIFESTS.includes(f.path) && isObject(value) && isObject(next)) for (const key of ["mcpServers", "hooks"]) if (namesFiles(value[key])) next[key] = value[key];
+    // Compact: no indentation can grow a nested file past the size it was checked at.
+    return { path: f.path, content: Buffer.from(JSON.stringify(next)) };
+  });
+}
+
 async function readTree(dir: string): Promise<Files> {
   const entries = await readdir(dir, { recursive: true, withFileTypes: true });
   return Promise.all(entries.filter((e) => e.isFile()).map(async (e) => ({ path: relative(dir, join(e.parentPath, e.name)).split("\\").join("/"), content: await readFile(join(e.parentPath, e.name)) })));
@@ -267,20 +348,22 @@ async function readTree(dir: string): Promise<Files> {
  * stored files with the servers Dispand manages, the hooks that could decide a permission and every
  * frontmatter key that could grant a tool left out, written read-only under `viewsDir` (the session's own, removed first).
  */
-export async function nativePluginViews(viewsDir: string, folders: { pluginId: string; dir: string }[], refs: NativePluginRef[]): Promise<{ pluginId: string; dir: string }[]> {
+export async function nativePluginViews(viewsDir: string, folders: { pluginId: string; dir: string }[], refs: NativePluginRef[], codex?: { cwd: string }): Promise<{ pluginId: string; dir: string }[]> {
   await unlock(viewsDir);
   await rm(viewsDir, { recursive: true, force: true });
   const out: { pluginId: string; dir: string }[] = [];
   for (const { pluginId, dir } of folders) {
     const managed = refs.find((r) => r.pluginId === pluginId)?.managedServers ?? [];
-    const files = withoutGrantingFrontmatter(withoutDecidingHooks(withoutServers(await readTree(dir), managed)));
+    const kept = withoutGrantingFrontmatter(withoutDecidingHooks(withoutServers(await readTree(dir), managed)));
+    // Codex runs it from the worker's mount of this view, where these paths lead.
+    const files = codex ? withClaudeVariables(kept, { CLAUDE_PLUGIN_ROOT: `${NATIVE_PLUGINS}/${pluginId}`, CLAUDE_PROJECT_DIR: codex.cwd }) : kept;
     out.push({ pluginId, dir: await writeReadOnly(viewsDir, join(viewsDir, pluginId), files, `The native plugin ${pluginId}`) });
   }
   return out;
 }
 
 /** Where Codex finds a conversation's marketplace in its worker: its plugins' folder (`NATIVE_PLUGINS`) is its root. */
-export const CODEX_MARKETPLACE = "/run/plugins/.claude-plugin/marketplace.json";
+export const CODEX_MARKETPLACE = `${NATIVE_PLUGINS}/.claude-plugin/marketplace.json`;
 
 /**
  * For Codex, which installs plugins from a marketplace: one listing the conversation's plugins,
