@@ -683,6 +683,9 @@ export class Engine {
       const [row] = await tx.insert(messages).values({ id: id ?? newId("msg"), ownerId: sender, runId, stepRunId: chat.id, role: "user", text, ...(files.length ? { files } : {}) }).returning();
       out.push({ type: "message", message: messageView(row!) });
       if (chat.resumeAfterSession) return { row: row!, working: false, chat };
+      // A personal chat's grant ended with its last turn: its worker is gone or going, so the message starts a
+      // fresh one on a grant of its own (`resume`), never reaching the old session.
+      if (chat.placement?.kind === "personal" && chat.sessionId && !(await stepGrant(tx, chat.id))) return { row: row!, working: false, chat, fresh: true };
       if (!chat.sessionId) return { row: row!, working: true, chat, restart: !OPEN_STEP.includes(previous.status), previous };
       // Codex followups stay in the database until the current turn gives its slot back.
       if (chat.harness?.kind === "codex" && (chat.turnStatus !== "idle" || chat.codexInputId)) return { row: row!, working: false, chat };
@@ -698,7 +701,7 @@ export class Engine {
     if ("skipped" in result) return { skipped: result.skipped };
     if ("queuedId" in result) return result;
     const { row, working, chat } = result;
-    if (chat.resumeAfterSession) {
+    if (chat.resumeAfterSession || ("fresh" in result && result.fresh)) {
       await this.resume(chat);
       return { sent: true };
     }
@@ -913,7 +916,8 @@ export class Engine {
       .where(and(eq(stepRuns.id, stepId), isNotNull(stepRuns.pendingAction), inArray(stepRuns.status, ACTIVE_STEP)))
       .returning();
     if (!claimed?.sessionId) return;
-    if (step.pendingAction.kind === "resume") await this.resume(claimed);
+    // A personal step whose grant ended with its turn has no worker to take what waits: it starts a fresh one.
+    if (step.pendingAction.kind === "resume" || (claimed.placement?.kind === "personal" && !(await stepGrant(this.db, claimed.id)))) await this.resume(claimed);
     else {
       await this.flush(claimed);
       if (claimed.runnerId === CLOUD_SOURCE) this.cloud?.resumeQueued?.(claimed.sessionId);
@@ -1892,7 +1896,11 @@ export class Engine {
     // Deliveries still under way are carried too (they never mark a lost session's rows delivered).
     const answered = await this.undeliveredAnswers(sessionId);
     // A resume carries its answers in its prompt: one a personal action's subscriber didn't give holds it, as its delivery would.
-    if (step.placement?.kind === "personal" && !(await this.personalUse(step.id, answered, { kind: "resume" }))) return;
+    if (step.placement?.kind === "personal") {
+      if (!(await this.personalUse(step.id, answered, { kind: "resume" }))) return;
+      // Even her own: the request it answers lived in the lost worker, and no replacement restores it (explicit recovery).
+      if (answered.length) return this.pausePersonal(step.id, { kind: "resume" }, "worker");
+    }
     const unsent = await undeliveredMessages(this.db, step.id);
     const { prompt, answers, messages: carried, laterAnswers, laterMessages } = resumePrompt(
       step.cliSessionId ? null : step.start!.prompt,
@@ -2100,6 +2108,9 @@ export class Engine {
         return null;
       }
       case "session-ended":
+        // A personal chat's worker retired between turns (its grant ended with the turn): it stays idle, and its
+        // next input starts a fresh worker (`chatInput`).
+        if (step.placement?.kind === "personal" && step.turnStatus === "idle" && !(await stepGrant(tx, step.id))) return null;
         await this.turn(tx, step, "unknown", out);
         await this.dropSteers(tx, step);
         return null;
@@ -2254,6 +2265,10 @@ export class Engine {
         }
         return (await this.complete(tx, step, { result: event.text }, out)) ? "advance" : null;
       case "error":
+        // A personal step this engine paused had its grant, and so its worker, ended by that pause: whatever that
+        // worker reports fails nothing and resumes nothing; the step waits for its recovery. A replacement holds a
+        // grant of its own, and its errors count.
+        if (step.placement?.kind === "personal" && (step.pendingAction as { paused?: unknown } | null)?.paused && !(await stepGrant(tx, step.id))) return null;
         // A start resent to a session the runner still has: it is live, nothing failed.
         if (event.kind === "already-running") {
           await tx.update(stepRuns).set({ startDeliveredAt: new Date() }).where(eq(stepRuns.id, step.id));
@@ -2571,18 +2586,22 @@ export class Engine {
   }
 
   /**
-   * Whether a personal step's answer may go to its session now. The subscriber's own goes once the
-   * placement's checks pass. Another person's waits, its worker kept, for the subscriber's own consent
-   * (`consent`); then it goes only to the worker that asked, while its grant holds (renewed by the
-   * same checks), and while that person may still answer it. Otherwise, as for an agent's answer, the
-   * action pauses for explicit recovery: no replacement worker holds the request it answers.
+   * Whether a personal step's answer may go to its session now: whoever gave it, only to the worker
+   * that asked, while its grant holds (renewed by the placement's checks); no replacement worker holds
+   * the request it answers, so otherwise the action pauses for explicit recovery. Another person's
+   * also waits, its worker kept, for the subscriber's own consent (`consent`), and goes only while
+   * that person may still answer it; an agent's never goes.
    */
   private async personalAnswer(q: QuestionRow): Promise<boolean> {
     const stepId = q.stepRunId!;
     const checked = await checkPlacement(this.db, stepId);
     if (checked.kind === "workspace") return true;
     if (checked.kind === "paused") return this.pauseDelivery(stepId, checked.reason);
-    if (!this.otherAnswerer(checked.actorId, q)) return true;
+    if (!this.otherAnswerer(checked.actorId, q)) {
+      const [own] = await this.db.select().from(questions).where(eq(questions.id, q.id));
+      if (!own || own.orphaned || !own.grantId || !(await checkGrant(this.db, checked.runnerId, own.grantId))) return this.pauseDelivery(stepId, "worker");
+      return true;
+    }
     if (q.answeredBy?.type !== "user") return this.pauseDelivery(stepId, "actor");
     const [now] = await this.db.select().from(questions).where(eq(questions.id, q.id));
     if (!now || !(await answererHolds(this.db as unknown as Tx, now))) return this.pauseDelivery(stepId, "approver");

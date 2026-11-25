@@ -67,6 +67,10 @@ export type SessionsOptions = {
   };
 };
 
+/** A personal action runs only in the container runner, in a gVisor worker: never on the bare install or under runc. */
+export const PERSONAL_NEEDS_GVISOR = "this runner can't run this personal action: personal subscriptions run only in the container runner under gVisor";
+/** Claude Code's relayed sign-in isn't verified yet: its personal actions are refused, never run on another credential. */
+export const CLAUDE_CODE_PERSONAL_PENDING = "Claude Code doesn't run on a personal subscription yet: only Codex does";
 /** A grant's session ends when its grant does: Dispand pauses the action. */
 export const GRANT_ENDED = "this action's personal grant ended";
 /** How long a grant waits for the runtime to confirm its run's previous worker is gone before it stays paused. */
@@ -162,9 +166,11 @@ export class Sessions {
   private readonly starting = new Map<string, SessionStart>();
   private stopMessage = "";
   /** Each grant's relay and session, until that session has ended. */
-  private readonly grants = new Map<string, { relay: GrantRelay; sessionId: string; runKey: string; worker?: Worker }>();
+  private readonly grants = new Map<string, { relay: GrantRelay; sessionId: string; runKey: string; worker?: Worker; retire: () => void }>();
   /** Grants that ended here, so a start that carries one again (or still prepares) never runs on it. */
   private readonly endedGrants = new Set<string>();
+  /** Sessions between turns (after `turn-end`): a grant that ends there retires the worker, which is no failure. */
+  private readonly idle = new Set<string>();
   /** Each run's session that holds a grant, until the runtime confirms its worker gone. */
   private readonly grantRuns = new Map<string, Promise<unknown>>();
 
@@ -212,6 +218,8 @@ export class Sessions {
     const session = this.live.get(held.sessionId);
     if (session) {
       this.stopping.add(held.sessionId);
+      // Its stop reports `session-ended` only; a replacement of the same id reports its own errors.
+      if (this.idle.has(held.sessionId)) held.retire();
       session.stop(GRANT_ENDED);
     }
     void held.worker?.remove().catch(() => undefined);
@@ -344,7 +352,12 @@ export class Sessions {
     let outcome = "exited";
     /** A resumed CLI that has reported nothing yet: failing now, it didn't take its transcript. */
     let unproven = false;
+    /** Set when this start's own worker retired between turns (its grant ended). */
+    let retired = false;
     const emit = (event: HarnessEvent) => {
+      if (event.type === "error" && retired) return;
+      if (event.type === "turn-end") this.idle.add(start.sessionId);
+      else if (event.type === "turn-start") this.idle.delete(start.sessionId);
       if (event.type !== "error") unproven = false;
       // shortcut: any failure of a resumed CLI before its first event counts (a sign-in lapse too), the next start is then fresh, told the conversation; classify per CLI if that costs a transcript that mattered.
       else if (unproven && !this.stopping.has(start.sessionId) && this.stops === stops) event = { ...event, kind: "cannot-resume" };
@@ -359,7 +372,8 @@ export class Sessions {
     // Stopping: nothing starts, and nothing is reported (Dispand starts it again after the restart).
     if (this.shuttingDown) return;
     // Every refusal known in advance comes before the run folder exists.
-    if (this.live.has(start.sessionId) || this.starting.has(start.sessionId)) return emit(SESSION_ALREADY_RUNNING);
+    // A personal session retiring (its grant ended) is no live one for its next grant's start: that start waits for its teardown below.
+    if ((this.live.has(start.sessionId) && !(start.grant && this.stopping.has(start.sessionId))) || this.starting.has(start.sessionId)) return emit(SESSION_ALREADY_RUNNING);
     // `hello` lists every live session, up to the protocol's limit.
     if (this.live.size + this.starting.size >= MAX_LIVE_SESSIONS) {
       return emit({ type: "error", message: `this runner already runs ${MAX_LIVE_SESSIONS} sessions, at most ${MAX_LIVE_SESSIONS} at once` });
@@ -394,16 +408,18 @@ export class Sessions {
       const since = { mono: performance.now(), wall: Date.now() };
       const options = this.options.personal;
       const harness = start.harness === "codex" ? "codex" : undefined;
-      if (!options || !sandbox || sandbox.runtime !== "runsc" || !harness || !Object.hasOwn(SUBSCRIPTION_PROVIDERS, harness)) {
-        return emit({ type: "error", message: "this runner can't run this personal action: it needs gVisor and a CLI it relays a subscription for" });
-      }
+      if (!harness) return emit({ type: "error", message: CLAUDE_CODE_PERSONAL_PENDING });
+      if (!options || !sandbox || sandbox.runtime !== "runsc" || !Object.hasOwn(SUBSCRIPTION_PROVIDERS, harness)) return emit({ type: "error", message: PERSONAL_NEEDS_GVISOR });
       const credential = options.credential(harness, grant.enrollmentId);
       if (!credential) return emit({ type: "error", message: "this runner holds no such enrollment: enroll the subscription again" });
       if (this.endedGrants.has(grant.id) || this.grants.has(grant.id)) return emit({ type: "error", message: GRANT_ENDED });
       // The run's previous grant ends here, and its worker must be confirmed gone, its whole process tree with it: else this one stays paused.
       for (const [id, held] of this.grants) if (held.runKey === start.cwd.runKey) this.endGrant(id);
       const previous = this.grantRuns.get(start.cwd.runKey);
+      // Registered while it waits: a permission update narrows this start (`handle`), never the retiring worker of the same id.
+      this.starting.set(start.sessionId, start);
       const gone = previous ? await Promise.race([previous.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), TEARDOWN_WAIT_MS).unref())]) : true;
+      this.starting.delete(start.sessionId);
       if (!gone) return emit({ type: "error", message: "this run's previous worker isn't confirmed gone yet: the action stays paused" });
       if (this.shuttingDown) return;
       personal = { grant, harness, credential, since };
@@ -496,7 +512,7 @@ export class Sessions {
         // Ended, or taken by another start, while this one prepared: checked as it is reserved, with no wait in between.
         if (this.endedGrants.has(personal.grant.id) || this.grants.has(personal.grant.id)) throw new Error(GRANT_ENDED);
         relay = new GrantRelay({ grant: personal.grant, harness: personal.harness, checks: this.options.personal!.checks, credential: personal.credential, since: personal.since, onLapse: () => this.endGrant(personal!.grant.id), ...(this.options.personal!.upstream ? { upstream: this.options.personal!.upstream } : {}) });
-        this.grants.set(relay.grantId, { relay, sessionId: start.sessionId, runKey: start.cwd.runKey });
+        this.grants.set(relay.grantId, { relay, sessionId: start.sessionId, runKey: start.cwd.runKey, retire: () => void (retired = true) });
       }
       worker = sandbox ? await sandbox.worker(cwd, join(this.config.roots[0]!, "cli", start.cwd.runKey), [], relay ? { relay: relay.handle } : {}) : undefined;
       if (relay) {
@@ -617,6 +633,7 @@ export class Sessions {
           this.ending.delete(ended);
           if (this.grantRuns.get(start.cwd.runKey) === ended) this.grantRuns.delete(start.cwd.runKey);
           const stopped = this.stopping.delete(start.sessionId);
+          this.idle.delete(start.sessionId);
           console.log(`dispand-runner: ${named} ended: ${stopped ? "stopped" : this.shuttingDown ? "aborted" : outcome}`);
           if (stopped && !this.shuttingDown) emit({ type: "session-ended" });
         });

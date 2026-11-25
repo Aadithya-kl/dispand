@@ -1,17 +1,17 @@
 import type { Grant } from "@dispand/runner-protocol";
 import { call } from "@orpc/server";
 import { and, eq } from "drizzle-orm";
-import { afterEach, beforeEach, describe, expect, onTestFinished, test, vi } from "vitest";
-import { audit, harnesses, personalGrants, questions, runners, runs, stepRuns, subscriptionEnrollments, workspaceMembers, type RunTrigger } from "../db/schema.ts";
+import { afterEach, describe, expect, onTestFinished, test, vi } from "vitest";
+import { agents, audit, harnesses, personalGrants, questions, runners, runs, stepRuns, subscriptionEnrollments, workspaceMembers, type RunTrigger } from "../db/schema.ts";
 import { router } from "../rpc/router.ts";
-import { checkGrant, GRANT_TTL_MS, onGrantEnd, personalForTests, personalSwitch } from "../runners/grants.ts";
+import { checkGrant, GRANT_TTL_MS, onGrantEnd, personalSwitch } from "../runners/grants.ts";
 import { asCli, ownerContext, personContext, runnerWithClis } from "../runners/test-support.ts";
 import { Engine } from "./engine.ts";
 import type { Harness, HarnessAdapter, StartParams } from "./harness.ts";
 import { JOB_STEP } from "./job-def.ts";
 
-// Personal placement (`runners/grants.ts`): Mia enrolled her Claude subscription on the runner,
-// which has no workspace model key. The switch is on for these tests, off by default.
+// Personal placement (`runners/grants.ts`): Mia enrolled her Codex subscription on the runner,
+// which has no workspace model key.
 
 class FakeAdapter implements HarnessAdapter {
   starts: { start: StartParams; grant: Grant | undefined }[] = [];
@@ -19,7 +19,9 @@ class FakeAdapter implements HarnessAdapter {
     this.starts.push({ start, grant });
     return true;
   }
-  async send() {
+  sent: string[] = [];
+  async send(_sessionId: string, text: string) {
+    this.sent.push(text);
     return true;
   }
   answered: string[] = [];
@@ -32,20 +34,19 @@ class FakeAdapter implements HarnessAdapter {
   }
 }
 
-beforeEach(() => void (personalSwitch.on = true));
-afterEach(() => void (personalSwitch.on = false));
+afterEach(() => void (personalSwitch.on = true));
 
 async function setup(limit = 2) {
   const context = await ownerContext();
   const mia = await personContext(context, "mia", "member");
   const { runnerId } = await runnerWithClis(context);
-  await context.db.update(runners).set({ clis: { claude: "2.1.248" } }).where(eq(runners.id, runnerId));
-  const harness = asCli(await call(router.harnesses.create, { name: "Claude", runnerId, kind: "claude-code", permissionMode: "default" }, { context }));
+  await context.db.update(runners).set({ clis: { codex: { version: "0.169.0", signedIn: true } } }).where(eq(runners.id, runnerId));
+  const harness = asCli(await call(router.harnesses.create, { name: "Codex", runnerId, kind: "codex", permissionMode: "default" }, { context }));
   await context.db.update(harnesses).set({ maxWorking: limit }).where(eq(harnesses.id, harness.id));
   const agent = await call(router.agents.create, { name: "Clerk", harnessId: harness.id, systemPrompt: "Be brief." }, { context });
   const trigger = await call(router.triggers.create, { agentId: agent.id, name: "Go", instructions: "Sort the mail.", config: { kind: "manual", placement: "button" } }, { context });
   const enroll = async (id: string) => {
-    await context.db.insert(subscriptionEnrollments).values({ id, workspaceId: context.workspaceId, runnerId, userId: "mia", harness: "claude-code", identity: `sha256:${"a".repeat(64)}` });
+    await context.db.insert(subscriptionEnrollments).values({ id, workspaceId: context.workspaceId, runnerId, userId: "mia", harness: "codex", identity: `sha256:${"a".repeat(64)}` });
   };
   await enroll("enr_1");
   const adapter = new FakeAdapter();
@@ -170,10 +171,111 @@ test("a runner with an enrollment and no workspace key is ready for its subscrib
     expect((await step(runId)).error).toContain("engine.fail.personalOnly");
   }
   // With a workspace key, everyone else's runs go on it, never on her subscription.
-  await context.db.update(runners).set({ clis: { claude: "2.1.248", modelKeys: ["anthropic"] } }).where(eq(runners.id, runnerId));
+  await context.db.update(runners).set({ clis: { codex: { version: "0.169.0", signedIn: true }, modelKeys: ["openai"] } }).where(eq(runners.id, runnerId));
   const owner = await job(context.ownerId);
   expect(startOf(owner)).toMatchObject({ grant: undefined });
   expect(await step(owner)).toMatchObject({ status: "running", placement: { kind: "workspace" } });
+});
+
+test("a personal chat's turn end retires its worker without failing it, and the next message resumes it on a grant of its own", async () => {
+  const { context, mia, runnerId, engine, adapter } = await setup();
+  const talk = await call(router.triggers.create, { agentId: (await context.db.select({ id: agents.id }).from(agents))[0]!.id, name: "Talk", instructions: "Help.", config: { kind: "manual", placement: "chat" } }, { context });
+  const { runId } = await call(router.jobs.start, { triggerId: talk.id }, { context: { ...mia, engine } });
+  const chat = async () => (await context.db.select().from(stepRuns).where(eq(stepRuns.runId, runId))).find((r) => r.start?.interactive)!;
+  await vi.waitFor(async () => expect((await chat())?.placement).toMatchObject({ kind: "personal", actorId: "mia" }));
+  const sessionId = (await chat()).sessionId;
+  const first = adapter.starts.find((s) => s.start.sessionId === sessionId)!;
+  expect(first.grant).toBeDefined();
+  let seq = 0;
+  const on = (sessionId: string, event: Parameters<Engine["onHarnessEvent"]>[1]) => engine.onHarnessEvent(sessionId, event, { runnerId, seq: ++seq });
+  await on(first.start.sessionId, { type: "text", delta: "How can I help?" });
+  await on(first.start.sessionId, { type: "turn-end" });
+  // What the runner sends when the grant ends between turns: its session retired, its worker gone, no error.
+  await on(first.start.sessionId, { type: "session-ended" });
+  expect(await chat()).toMatchObject({ status: "running", error: null });
+  expect(await context.db.select().from(personalGrants)).toEqual([]);
+  // Her next message never goes to the retired session: it starts a fresh worker, on a new grant.
+  const starts = adapter.starts.length;
+  await call(router.runs.sendChat, { runId, text: "And the rest?" }, { context: { ...mia, engine } });
+  await vi.waitFor(() => expect(adapter.starts.length).toBe(starts + 1));
+  expect(adapter.sent).toEqual([]);
+  const next = adapter.starts.at(-1)!;
+  expect(next.grant).toBeDefined();
+  expect(next.grant!.id).not.toBe(first.grant!.id);
+  expect(next.start.prompt).toContain("And the rest?");
+  expect(await context.db.select({ reason: audit.details }).from(audit).where(and(eq(audit.jobId, runId), eq(audit.action, "job.paused")))).toEqual([]);
+});
+
+test("a message she queued during a personal turn goes to a fresh worker after it, never the retiring one", async () => {
+  const { context, mia, runnerId, engine, adapter } = await setup();
+  const talk = await call(router.triggers.create, { agentId: (await context.db.select({ id: agents.id }).from(agents))[0]!.id, name: "Talk", instructions: "Help.", config: { kind: "manual", placement: "chat" } }, { context });
+  const { runId } = await call(router.jobs.start, { triggerId: talk.id }, { context: { ...mia, engine } });
+  const chat = async () => (await context.db.select().from(stepRuns).where(eq(stepRuns.runId, runId))).find((r) => r.start?.interactive)!;
+  await vi.waitFor(async () => expect((await chat())?.sessionId).toBeTruthy());
+  const sessionId = (await chat()).sessionId!;
+  let seq = 0;
+  const on = (event: Parameters<Engine["onHarnessEvent"]>[1]) => engine.onHarnessEvent(sessionId, event, { runnerId, seq: ++seq });
+  await on({ type: "turn-start", turnId: "t1", interruptible: true });
+  await call(router.runs.sendChat, { runId, text: "Queued meanwhile" }, { context: { ...mia, engine } });
+  const starts = adapter.starts.length;
+  await on({ type: "turn-end", turnId: "t1" });
+  await vi.waitFor(() => expect(adapter.starts.length).toBe(starts + 1));
+  expect(adapter.starts.at(-1)!.start.prompt).toContain("Queued meanwhile");
+  expect(adapter.starts.at(-1)!.grant).toBeDefined();
+  expect(adapter.sent).toEqual([]);
+});
+
+test("a message sent as her chat starts, that its first turn didn't take, goes to a fresh worker after that turn", async () => {
+  const { context, mia, runnerId, engine, adapter } = await setup();
+  const talk = await call(router.triggers.create, { agentId: (await context.db.select({ id: agents.id }).from(agents))[0]!.id, name: "Talk", instructions: "Help.", config: { kind: "manual", placement: "chat" } }, { context });
+  const { runId } = await call(router.jobs.start, { triggerId: talk.id }, { context: { ...mia, engine } });
+  await call(router.runs.sendChat, { runId, text: "Sent at once" }, { context: { ...mia, engine } });
+  const chat = async () => (await context.db.select().from(stepRuns).where(eq(stepRuns.runId, runId))).find((r) => r.start?.interactive)!;
+  await vi.waitFor(async () => expect((await chat())?.startDeliveredAt).toBeTruthy());
+  const sessionId = (await chat()).sessionId!;
+  let seq = 0;
+  const on = (event: Parameters<Engine["onHarnessEvent"]>[1]) => engine.onHarnessEvent(sessionId, event, { runnerId, seq: ++seq });
+  // The first turn answers the start's own prompt, and ends without taking the message.
+  await on({ type: "turn-start", turnId: "t1", interruptible: true });
+  const starts = adapter.starts.length;
+  const sent = adapter.sent.length;
+  await on({ type: "turn-end", turnId: "t1" });
+  await vi.waitFor(() => expect(adapter.starts.length).toBe(starts + 1));
+  expect(adapter.starts.at(-1)!.start.prompt).toContain("Sent at once");
+  expect(adapter.starts.at(-1)!.grant).toBeDefined();
+  expect(adapter.sent.length).toBe(sent);
+});
+
+test("an answer her worker took in a finished turn stays settled, even when its worker is lost unannounced: the next message isn't paused", async () => {
+  const { context, mia, runnerId, engine, adapter } = await setup();
+  const talk = await call(router.triggers.create, { agentId: (await context.db.select({ id: agents.id }).from(agents))[0]!.id, name: "Talk", instructions: "Help.", config: { kind: "manual", placement: "chat" } }, { context });
+  const { runId } = await call(router.jobs.start, { triggerId: talk.id }, { context: { ...mia, engine } });
+  const chat = async () => (await context.db.select().from(stepRuns).where(eq(stepRuns.runId, runId))).find((r) => r.start?.interactive)!;
+  await vi.waitFor(async () => expect((await chat())?.sessionId).toBeTruthy());
+  const sessionId = (await chat()).sessionId!;
+  let seq = 0;
+  const on = (event: Parameters<Engine["onHarnessEvent"]>[1]) => engine.onHarnessEvent(sessionId, event, { runnerId, seq: ++seq });
+  await on({ type: "question", questionId: "rq_done", payload: { kind: "choice", questions: [{ question: "Which?", header: "Pick", multiSelect: false, options: [{ label: "A", description: "" }] }] } });
+  const [q] = await context.db.select().from(questions).where(eq(questions.runId, runId));
+  await call(router.questions.answer, { questionId: q!.id, answer: { kind: "choice", answers: { "Which?": "A" } } }, { context: { ...mia, engine } });
+  await vi.waitFor(() => expect(adapter.answered).toEqual(["rq_done"]));
+  await on({ type: "turn-end" });
+  const starts = adapter.starts.length;
+  await call(router.runs.sendChat, { runId, text: "Next" }, { context: { ...mia, engine } });
+  await vi.waitFor(() => expect(adapter.starts.length).toBe(starts + 1));
+  expect(adapter.starts.at(-1)!.grant).toBeDefined();
+  expect(adapter.starts.at(-1)!.start.prompt).toContain("Next");
+  expect(await context.db.select().from(audit).where(and(eq(audit.jobId, runId), eq(audit.action, "job.paused")))).toEqual([]);
+});
+
+test("a Claude Code subscription places nothing personally: only Codex is open", async () => {
+  const { context, harness, job, step, startOf } = await setup();
+  await context.db.update(harnesses).set({ kind: "claude-code" }).where(eq(harnesses.id, harness.id));
+  await context.db.update(subscriptionEnrollments).set({ harness: "claude-code" });
+  const runId = await job("mia");
+  expect(startOf(runId)).toMatchObject({ grant: undefined });
+  expect(await step(runId)).toMatchObject({ placement: { kind: "workspace" } });
+  expect(await context.db.select().from(personalGrants)).toEqual([]);
 });
 
 test("with the switch off, nothing is placed personally", async () => {
@@ -350,6 +452,44 @@ describe("personal-approvals", () => {
     expect(adapter.answered).toEqual([]);
   });
 
+  test("the subscriber's own answer to a request in a lost worker isn't carried into a replacement: the action pauses", async () => {
+    const { context, mia, runnerId, adapter, engine, job, startOf, paused } = await approvals();
+    const runId = await job("mia");
+    const sessionId = startOf(runId)!.start.sessionId;
+    await engine.onHarnessEvent(sessionId, { type: "question", questionId: "rq_own", payload: choice }, { runnerId, seq: 500 });
+    const [q] = await context.db.select().from(questions).where(eq(questions.runId, runId));
+    await call(router.questions.answer, { questionId: q!.id, answer: { kind: "choice", answers: { "Which?": "A" } } }, { context: mia });
+    // The worker that asked is lost before the answer is confirmed there: no replacement restores the request.
+    const starts = adapter.starts.length;
+    await engine.onHarnessEvent(sessionId, { type: "error", kind: "not-running", message: "gone" }, { runnerId, seq: 501 });
+    await vi.waitFor(async () => expect(await paused(runId)).toEqual([{ reason: "worker" }]));
+    expect(adapter.starts).toHaveLength(starts);
+  });
+
+  test("the subscriber's own answer, given after her lost worker was replaced, reaches no worker: the action pauses", async () => {
+    const { context, mia, runnerId, adapter, engine, job, startOf, paused } = await approvals();
+    const runId = await job("mia");
+    const sessionId = startOf(runId)!.start.sessionId;
+    await engine.onHarnessEvent(sessionId, { type: "question", questionId: "rq_late", payload: choice }, { runnerId, seq: 600 });
+    // Lost while the request waits: a replacement starts, without it.
+    const starts = adapter.starts.length;
+    await engine.onHarnessEvent(sessionId, { type: "error", kind: "not-running", message: "gone" }, { runnerId, seq: 601 });
+    await vi.waitFor(() => expect(adapter.starts.length).toBe(starts + 1));
+    const [q] = await context.db.select().from(questions).where(eq(questions.runId, runId));
+    await call(router.questions.answer, { questionId: q!.id, answer: { kind: "choice", answers: { "Which?": "A" } } }, { context: mia });
+    await vi.waitFor(async () => expect(await paused(runId)).toEqual([{ reason: "worker" }]));
+    expect(adapter.answered).toEqual([]);
+    expect(adapter.sent).toEqual([]);
+    // The pause ended the replacement's grant mid-turn: what its stopped worker reports leaves the step paused, not failed.
+    await engine.onHarnessEvent(sessionId, { type: "error", message: "this action's personal grant ended" }, { runnerId, seq: 602 });
+    const [now] = await context.db.select().from(stepRuns).where(eq(stepRuns.sessionId, sessionId));
+    expect(now).toMatchObject({ status: "running", error: null, pendingAction: { paused: "worker" } });
+    // A replacement started on its recovery holds a grant of its own: its errors count again.
+    await context.db.insert(personalGrants).values({ id: "grant_next", workspaceId: context.workspaceId, stepRunId: now!.id, runnerId, enrollmentId: "enr_1", actorId: "mia", expiresAt: new Date(Date.now() + 60_000) });
+    await engine.onHarnessEvent(sessionId, { type: "error", message: "the CLI failed" }, { runnerId, seq: 603 });
+    expect((await context.db.select().from(stepRuns).where(eq(stepRuns.sessionId, sessionId)))[0]).toMatchObject({ status: "failed" });
+  });
+
   test("a consent under a replaced enrollment continues nothing, nor one whose answerer may no longer answer", async () => {
     const { context, adapter, answeredByManager, consent, enroll, paused } = await approvals();
     const replaced = await answeredByManager("rq_1");
@@ -363,14 +503,6 @@ describe("personal-approvals", () => {
     await vi.waitFor(async () => expect(await paused(replaced.runId)).toEqual([{ reason: "enrollment" }]));
     expect(adapter.answered).toEqual([]);
   });
-});
-
-test("the switch turns on for a development app only, never a production build", () => {
-  personalSwitch.on = false;
-  expect(personalForTests("production")).toBe(false);
-  expect(personalSwitch.on).toBe(false);
-  expect(personalForTests("development")).toBe(true);
-  expect(personalSwitch.on).toBe(true);
 });
 
 test("a workspace-credential step says so, and pauses nothing", async () => {
