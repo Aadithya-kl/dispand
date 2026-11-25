@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { contentDigest } from "@dispand/runner-protocol/digest";
 import { afterEach, expect, test } from "vitest";
 import { unlock } from "../skills.ts";
-import { nativePluginFolders, nativePluginViews, sweepNativePlugins, withoutServers, type FetchNative } from "./native-plugins.ts";
+import { codexMarketplace, nativePluginFolders, nativePluginViews, sweepNativePlugins, withoutDecidingHooks, withoutServers, type FetchNative } from "./native-plugins.ts";
 
 const files = [{ path: ".claude-plugin/plugin.json", content: Buffer.from('{"name":"demo"}') }, { path: "hooks/hooks.json", content: Buffer.from("{}") }];
 const digest = contentDigest(files);
@@ -136,8 +136,10 @@ test("a view is derived at each start from the stored files, which stay as they 
   const d = contentDigest(declared);
   const stored = await nativePluginFolders(state, [{ pluginId: "plugin_a", digest: d }], serve(declared).fetchFiles);
   const views = join(state, "views");
-  // No managed server yet: the stored folder itself.
-  expect(await nativePluginViews(views, stored, [{ pluginId: "plugin_a", digest: d, managedServers: [] }])).toEqual(stored);
+  // No managed server yet: a view all the same (hooks are filtered too), with every server.
+  const [first] = await nativePluginViews(views, stored, [{ pluginId: "plugin_a", digest: d, managedServers: [] }]);
+  expect(first!.dir).toBe(join(views, "plugin_a"));
+  expect(Object.keys(JSON.parse(await readFile(join(first!.dir, ".claude-plugin/plugin.json"), "utf8")).mcpServers)).toEqual(["notes", "search"]);
   // Registered since, same digest: left out at the next start, in a read-only view of its own.
   const [view] = await nativePluginViews(views, stored, [{ pluginId: "plugin_a", digest: d, managedServers: ["notes"] }]);
   expect(view!.dir).toBe(join(views, "plugin_a"));
@@ -149,4 +151,73 @@ test("a view is derived at each start from the stored files, which stay as they 
   const [again] = await nativePluginViews(views, stored, [{ pluginId: "plugin_a", digest: d, managedServers: ["search"] }]);
   expect(await manifest(again!.dir)).toEqual(["notes"]);
   await unlock(views);
+});
+
+test("Codex's marketplace lists each plugin under its manifest's name at ./<id>, read-only; two names alike are refused", async () => {
+  state = await mkdtemp(join(tmpdir(), "native-"));
+  const { fetchFiles } = serve();
+  const plain = [{ path: "skills/x/SKILL.md", content: Buffer.from("---\nname: x\ndescription: x\n---\n") }];
+  const stored = [
+    ...(await nativePluginFolders(state, [{ pluginId: "plugin_a", digest }], fetchFiles)),
+    ...(await nativePluginFolders(state, [{ pluginId: "plugin_B", digest: contentDigest(plain) }], async () => plain)),
+  ];
+  const views = join(state, "views");
+  const market = await codexMarketplace(views, stored);
+  expect(market.names).toEqual(["demo", "dispand-plugin-b"]);
+  expect(JSON.parse(await readFile(join(market.dir, "marketplace.json"), "utf8"))).toEqual({ name: "dispand", owner: { name: "Dispand" }, plugins: [{ name: "demo", source: "./plugin_a" }, { name: "dispand-plugin-b", source: "./plugin_B" }] });
+  await expect(writeFile(join(market.dir, "marketplace.json"), "x")).rejects.toThrow();
+  await unlock(views);
+  await rm(views, { recursive: true, force: true });
+  await expect(codexMarketplace(views, [stored[0]!, { pluginId: "plugin_c", dir: stored[0]!.dir }])).rejects.toThrow("both named demo");
+  await unlock(views);
+});
+
+test("Codex's marketplace takes the name of the manifest Codex reads, and its own manifest is filtered too", async () => {
+  state = await mkdtemp(join(tmpdir(), "native-"));
+  const both = [
+    { path: ".codex-plugin/plugin.json", content: Buffer.from(JSON.stringify({ name: "codex-name", mcpServers: { notes: { command: "x" }, kept: { command: "y" } } })) },
+    { path: ".claude-plugin/plugin.json", content: Buffer.from('{"name":"claude-name"}') },
+  ];
+  const standard = [{ path: "plugin.json", content: Buffer.from('{"name":"standard-name"}') }];
+  const stored = [
+    ...(await nativePluginFolders(state, [{ pluginId: "plugin_a", digest: contentDigest(both) }], async () => both)),
+    ...(await nativePluginFolders(state, [{ pluginId: "plugin_s", digest: contentDigest(standard) }], async () => standard)),
+  ];
+  const views = await nativePluginViews(join(state, "views"), stored, [{ pluginId: "plugin_a", digest: contentDigest(both), managedServers: ["notes"] }, { pluginId: "plugin_s", digest: contentDigest(standard) }]);
+  expect(Object.keys(JSON.parse(await readFile(join(views[0]!.dir, ".codex-plugin", "plugin.json"), "utf8")).mcpServers)).toEqual(["kept"]);
+  expect((await codexMarketplace(join(state, "views"), views)).names).toEqual(["codex-name", "standard-name"]);
+  await unlock(join(state, "views"));
+  // A root manifest declaring its schema comes before Codex's own.
+  const schema = [{ path: "plugin.json", content: Buffer.from(JSON.stringify({ $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", name: "root-name" })) }, { path: ".codex-plugin/plugin.json", content: Buffer.from('{"name":"overlay-name"}') }];
+  const s = await nativePluginFolders(state, [{ pluginId: "plugin_r", digest: contentDigest(schema) }], async () => schema);
+  expect((await codexMarketplace(join(state, "views2"), s)).names).toEqual(["root-name"]);
+  await unlock(join(state, "views2"));
+});
+
+test("a hook that could decide a permission is left out of every place a plugin declares hooks; the others stay", () => {
+  const events = (deciding: string, other: string) => ({ [deciding]: [{ hooks: [{ type: "command", command: "allow" }] }], [other]: [{ hooks: [{ type: "command", command: "log" }] }] });
+  const read = (out: { path: string; content: Buffer }[], path: string) => JSON.parse(out.find((f) => f.path === path)!.content.toString());
+  const out = withoutDecidingHooks([
+    { path: "hooks/hooks.json", content: json({ description: "d", hooks: events("PreToolUse", "PostToolUse") }) },
+    { path: "hooks.json", content: json({ hooks: events("permissionRequest", "stop") }) },
+    { path: ".claude-plugin/plugin.json", content: json({ name: "a", hooks: events("PermissionRequest", "SessionStart") }) },
+    { path: ".codex-plugin/plugin.json", content: json({ name: "a", hooks: "./more/hooks.json" }) },
+    { path: "more/hooks.json", content: json({ hooks: events("preToolUse", "userPromptSubmit") }) },
+  ]);
+  expect(read(out, "hooks/hooks.json")).toEqual({ description: "d", hooks: { PostToolUse: expect.any(Array) } });
+  expect(Object.keys(read(out, "hooks.json").hooks)).toEqual(["stop"]);
+  expect(Object.keys(read(out, ".claude-plugin/plugin.json").hooks)).toEqual(["SessionStart"]);
+  expect(read(out, ".codex-plugin/plugin.json").hooks).toBe("./more/hooks.json");
+  expect(Object.keys(read(out, "more/hooks.json").hooks)).toEqual(["userPromptSubmit"]);
+});
+
+test("a hooks declaration of a shape the filter doesn't read for sure is dropped whole; nothing else of the plugin is lost", () => {
+  const out = withoutDecidingHooks([
+    { path: "hooks/hooks.json", content: json([{ PreToolUse: [] }]) },
+    { path: "hooks.json", content: Buffer.from("not json") },
+    { path: ".claude-plugin/plugin.json", content: json({ name: "a", hooks: { PreToolUse: "allow" } }) },
+    { path: "skills/x/SKILL.md", content: Buffer.from("x") },
+  ]);
+  expect(out.map((f) => f.path).sort()).toEqual([".claude-plugin/plugin.json", "skills/x/SKILL.md"]);
+  expect(JSON.parse(out.find((f) => f.path === ".claude-plugin/plugin.json")!.content.toString())).toEqual({ name: "a" });
 });
