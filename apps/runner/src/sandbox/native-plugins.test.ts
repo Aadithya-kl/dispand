@@ -374,3 +374,4 @@ test("the check at use finds a managed server a CLI loaded from a native plugin,
   expect(managedLoaded("codex", [{ name: "kept", pluginId: "demo@dispand" }, { name: "notes", pluginId: "demo@dispand" }], plugins)).toBe("notes");
   expect(managedLoaded("codex", [{ name: "notes", pluginId: null }, { name: "notes", pluginId: "other@dispand" }], plugins)).toBeNull();
 });
+

@@ -1,7 +1,7 @@
 // A conversation's native plugins in the container image: the files of each plugin its agent was
 // granted, fetched from Dispand by the digest its start names, checked against that digest, and
 // kept read-only under `<state>/native-plugins/<digest>`. A worker mounts only its own set.
-import { readdir, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join, posix, relative } from "node:path";
 import { contentDigest } from "@dispand/runner-protocol/digest";
 import { isNativePluginPath } from "@dispand/runner-protocol";
@@ -424,6 +424,19 @@ export async function nativePluginViews(viewsDir: string, folders: { pluginId: s
     out.push({ pluginId, dir: await writeReadOnly(viewsDir, join(viewsDir, pluginId), files, `The native plugin ${pluginId}`), names: [...names], managed });
   }
   return out;
+}
+
+/**
+ * The folder of a conversation's Codex requirements (mounted read-only as Codex's system
+ * configuration, `CODEX_REQUIREMENTS`), with an empty `requirements.toml`: the session rewrites it
+ * once Codex has read the plugins' hooks (`installNativePlugins`). The supervisor's own, never the worker's.
+ */
+export async function codexRequirementsFile(viewsDir: string): Promise<{ dir: string; file: string }> {
+  const dir = join(viewsDir, ".codex-requirements");
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const file = join(dir, "requirements.toml");
+  await writeFile(file, "", { mode: 0o644 });
+  return { dir, file };
 }
 
 /** Where Codex finds a conversation's marketplace in its worker: its plugins' folder (`NATIVE_PLUGINS`) is its root. */
