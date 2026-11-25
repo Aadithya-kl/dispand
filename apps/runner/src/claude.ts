@@ -1,3 +1,4 @@
+import { managedLoaded, managedLoadedError, type ManagedNative } from "./sandbox/native-plugins.ts";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
@@ -45,6 +46,8 @@ export type ClaudeDeps = {
    * worker, loaded whole (commands, agents, skills, hooks, MCP servers but the managed ones).
    */
   nativePlugins?: string[];
+  /** Each native plugin's names and the servers Dispand manages for it: checked against what Claude Code loaded (`managedLoaded`). */
+  nativeManaged?: ManagedNative[];
   /** Where each plugin server of the session starts, by its name: paths in its arguments are read from there. */
   serverDirs?: Record<string, string>;
   /** The session's MCP servers (`mcp.ts` `mcpConfigFor`): each must connect before the first turn. */
@@ -552,7 +555,20 @@ export function startClaudeSession(
   if (start.prompt || !start.interactive) say(start.prompt);
   else emit({ type: "turn-end" });
   const servers = deps.mcpServers ?? {};
-  if (Object.keys(servers).length === 0) openGate();
+  // With native plugins, the first prompt waits for the check at use: the servers Claude Code
+  // loaded, listed over its control channel, include none Dispand manages for those plugins.
+  const release = !nativePlugins.length ? openGate : () => {
+    void q.mcpServerStatus().then(
+      (loaded) => {
+        const managed = managedLoaded("claude-code", loaded, deps.nativeManaged ?? []);
+        if (!managed) return openGate();
+        console.error(`dispand-runner: session ${start.sessionId} loaded the managed server ${managed} from a native plugin: stopped`);
+        finish({ type: "error", message: managedLoadedError(managed) });
+      },
+      () => finish({ type: "error", message: "the session's MCP servers couldn't be listed" }),
+    );
+  };
+  if (Object.keys(servers).length === 0) release();
   else {
     // Over the SDK's control channel, never the CLI's command line (`--mcp-config`), where any
     // user of the machine could read the headers. `dispand` goes last: it stays ours.
@@ -563,7 +579,7 @@ export function startClaudeSession(
         if (failed) finish({ type: "error", message: `the MCP server ${failed} didn't connect` });
       },
       () => finish({ type: "error", message: "the session's MCP servers couldn't be set up" }),
-    ).finally(openGate);
+    ).finally(release);
   }
 
   /** The session's last event: queued turns are dropped, the CLI stops, later events are dropped. */
@@ -616,7 +632,9 @@ export function startClaudeSession(
       for await (const msg of q) {
         if (msg.type === "system" && msg.subtype === "init") {
           emit({ type: "cli-session", cliSessionId: msg.session_id });
-          const failure = pluginFailure(msg.plugin_errors, pluginRoots) ?? pluginFailure(msg.plugin_errors, nativePlugins, "native plugin");
+          const managed = nativePlugins.length ? managedLoaded("claude-code", msg.mcp_servers ?? [], deps.nativeManaged ?? []) : null;
+          if (managed) console.error(`dispand-runner: session ${start.sessionId} loaded the managed server ${managed} from a native plugin: stopped`);
+          const failure = (managed && managedLoadedError(managed)) ?? pluginFailure(msg.plugin_errors, pluginRoots) ?? pluginFailure(msg.plugin_errors, nativePlugins, "native plugin");
           if (failure) finish({ type: "error", message: failure });
           else turnStarted();
         } else if (msg.type === "system" && msg.subtype === "session_state_changed" && (msg.state === "running" || msg.state === "requires_action")) {
