@@ -125,6 +125,17 @@ test("a scoped Codex denial stops the session instead of pretending later automa
   expect(s.events).toContainEqual({ type: "error", message: CODEX_DENIAL_UNSUPPORTED });
 });
 
+test("each agent message's text opens with its first delta, so a steered message's answer is never part of the one before (#475)", async () => {
+  const delta = (itemId: string, text: string): Step => ({ notify: "item/agentMessage/delta", params: { threadId: "$THREAD", turnId: "$TURN", itemId, delta: text } });
+  const s = await run({ turns: [[delta("m1", "…still lit. "), delta("m1", "ENDA"), delta("m2", "PONG-B"), message("PONG-B")]] });
+  await s.ended();
+  expect(s.events.filter((e) => e.type === "text")).toEqual([
+    { type: "text", delta: "…still lit. ", start: true },
+    { type: "text", delta: "ENDA" },
+    { type: "text", delta: "PONG-B", start: true },
+  ]);
+});
+
 test("a session starts a thread with Dispand's profile and instructions, streams its turn and ends with its last message", async () => {
   const s = await run({
     turns: [
@@ -143,7 +154,7 @@ test("a session starts a thread with Dispand's profile and instructions, streams
   expect(s.events).toEqual([
     { type: "cli-session", cliSessionId: "thr_1" },
     { type: "turn-start", turnId: "turn_0", interruptible: true },
-    { type: "text", delta: "Hel" },
+    { type: "text", delta: "Hel", start: true },
     { type: "tool", name: "Shell", status: "started" },
     { type: "tool", name: "Shell", status: "done" },
     { type: "result", text: "Hello" },
