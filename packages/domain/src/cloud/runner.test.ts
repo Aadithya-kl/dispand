@@ -75,7 +75,7 @@ test.each([false, true])("interrupt fences late model output and errors, preserv
   const events: unknown[] = [];
   runner.onEvent(async (_id, event) => { events.push(event); });
   await runner.send(sessionId, "First input");
-  await vi.waitFor(() => expect(events).toContainEqual({ type: "text", delta: "Partial answer" }));
+  await vi.waitFor(() => expect(events).toContainEqual({ type: "text", delta: "Partial answer", start: true }));
   const first = (await session()).turnId!;
   expect(await runner.interrupt(sessionId, first)).toBe("requested");
   expect(await session()).toMatchObject({ status: "idle", pending: null, inFlight: null });
@@ -195,6 +195,11 @@ test("a steer during the turn's last model call joins that turn: the turn goes o
   expect(events).toContainEqual({ type: "steer-result", turnId, requestId: "msg_1", outcome: "steered" });
   expect(events.filter((e) => e.type === "turn-start")).toEqual([{ type: "turn-start", turnId, interruptible: true }]);
   expect(events.filter((e) => e.type === "turn-end")).toEqual([{ type: "turn-end", turnId }]);
+  // The steered message's answer opens a message of its own (#475).
+  expect(events.filter((e) => e.type === "text")).toEqual([
+    { type: "text", delta: "First answer", start: true },
+    { type: "text", delta: "Steered answer", start: true },
+  ]);
 });
 
 test("a steer for a turn that already ended is the next message: it starts a turn of its own", async () => {
