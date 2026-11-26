@@ -549,9 +549,12 @@ export class CloudRunner implements HarnessAdapter<CloudHarness> {
       await this.active(id, execution, () => this.emit(id, { status: "done" }, { type: "error", message }));
       return;
     }
+    // Each model call's text is a message of its own: one that read a steered message answers it.
+    let opening = true;
     const text = textStream(async (delta) => { await this.active(id, execution, async () => {
       execution.text += delta;
-      await this.emit(id, {}, { type: "text", delta });
+      await this.emit(id, {}, { type: "text", delta, ...(opening ? { start: true as const } : {}) });
+      opening = false;
     }); });
     let turn: ModelTurn;
     try {
