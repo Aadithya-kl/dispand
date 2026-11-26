@@ -800,6 +800,31 @@ test("chat run waits for outputs then starts the step with rendered prompt", asy
   ]);
 });
 
+test("each message the agent opens is a row of its own: a steered message's answer never ends the one before (#475)", async () => {
+  const { adapter, engine, emit, workflow } = await setup(chatThenStep);
+  const runId = await engine.startRun(workflow.id);
+  const chatSession = adapter.starts[0]!.start.sessionId;
+  await emit(chatSession, { type: "cli-session", cliSessionId: "cli_1" });
+  await emit(chatSession, { type: "text", delta: "What ", start: true });
+  await emit(chatSession, { type: "text", delta: "shall we build?" });
+  await emit(chatSession, { type: "turn-end" });
+  await engine.sendChat(runId, "Write a story. End it with the word ENDA.");
+  await engine.idle();
+  // The owner's next message was steered into the turn: the agent answers it in a message of its own.
+  await emit(chatSession, { type: "text", delta: "…the way home is still lit.\n\n", start: true });
+  await emit(chatSession, { type: "text", delta: "ENDA" });
+  await emit(chatSession, { type: "text", delta: "PONG-B", start: true });
+  await emit(chatSession, { type: "turn-end" });
+
+  const transcript = await engine.db.select().from(messages).where(eq(messages.runId, runId)).orderBy(messages.position);
+  expect(transcript.map((m) => [m.role, m.text])).toEqual([
+    ["assistant", "What shall we build?"],
+    ["user", "Write a story. End it with the word ENDA."],
+    ["assistant", "…the way home is still lit.\n\nENDA"],
+    ["assistant", "PONG-B"],
+  ]);
+});
+
 test("step result is stored", async () => {
   const { adapter, engine, emit, workflow } = await setup(buttonThenStep);
   const runId = await engine.startRun(workflow.id);
