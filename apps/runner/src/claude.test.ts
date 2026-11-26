@@ -149,6 +149,33 @@ test("native turn evidence starts each turn once, before its text, without treat
   await session.done;
 });
 
+test("each of the CLI's messages opens with its first text, so a steered message's answer is never part of the one before (#475)", async () => {
+  const messageStart = (parent: string | null = null) => ({ type: "stream_event", parent_tool_use_id: parent, event: { type: "message_start", message: {} } }) as SDKMessage;
+  const fake = fakeQuery(async function* ({ next }) {
+    await next();
+    yield init;
+    yield messageStart();
+    yield delta("…still lit.\n\n");
+    yield delta("ENDA");
+    // A subagent's message stays inside its tool: it opens nothing here.
+    yield messageStart("tu_sub");
+    // The CLI read the message sent meanwhile and answers it in a message of its own.
+    yield messageStart();
+    yield delta("PONG-B");
+    yield result();
+    await next();
+  });
+  const { events, session } = run(start, fake.query);
+  await vi.waitFor(() => expect(events.at(-1)).toEqual(expect.objectContaining({ type: "turn-end" })));
+  expect(events.filter((event) => event.type === "text")).toEqual([
+    { type: "text", delta: "…still lit.\n\n", start: true },
+    { type: "text", delta: "ENDA" },
+    { type: "text", delta: "PONG-B", start: true },
+  ]);
+  session.close();
+  await session.done;
+});
+
 test("saved native rules pass the boundary first and never become SDK wildcard settings", async () => {
   const hooks: unknown[] = [];
   const decisions: unknown[] = [];
