@@ -1376,7 +1376,11 @@
   only one waiting and no question waits; a question asked while the steer is on its way makes the
   cut a turn of its own, so the engine withdraws it. A cloud session queues it under its lock: while turn `turnId` runs, the next model call
   reads it and the turn goes on until no message is left (`steered`); otherwise it starts the next
-  turn.
+  turn. A steered message is answered in a message of the agent's own, so the first `text` delta
+  of each of the agent's messages carries `start` (protocol 41: Claude Code's `message_start`, a
+  new Codex agent message item, each cloud model call): the engine gives it a new assistant row
+  rather than appending it to the answer before. The runner never folds or holds such a delta
+  behind the text before it, and splits a long one with only its first piece opening the message.
 - **Secrets at rest:** `packages/domain/src/secrets.ts` is the one secret box (the tool headers use it too). `createSecretBox(key)`
   seals with AES-256-GCM and a random 12-byte IV into `v1.<iv>.<ciphertext+tag>` (base64url);
   `seal` and `open` take an AAD, `secretAad(table, rowId, field, origin?)`, which binds the value
