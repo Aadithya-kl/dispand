@@ -238,7 +238,7 @@ export class Engine {
     readonly db: Db,
     private readonly adapter: HarnessAdapter,
     /** Sessions run in this process (`CloudRunner`), reconciled on `recover()` under `CLOUD_SOURCE`. */
-    private readonly cloud?: { recover(going: (runId: string) => Promise<boolean>): Promise<string[]>; resumeQueued?(sessionId: string): void },
+    private readonly cloud?: { recover(going: (runId: string) => Promise<boolean>): Promise<string[]>; resumeQueued?(sessionId: string): void; close?(): Promise<void> },
     /** Where data steps publish the rows they write (`rows.stream`). */
     private readonly dataEvents?: DataEvents,
     /** Runs Tool steps (`connectorToolExecutor`); without one, they fail. */
@@ -1784,11 +1784,14 @@ export class Engine {
   }
 
   /**
-   * On shutdown, once nothing starts new work (the hub and the scheduler are stopped): waits for
-   * the starts and deliveries under way, so the database can close after them.
+   * On shutdown, once nothing starts new work (the hub and the scheduler are stopped): cuts its
+   * cloud sessions' turns (`CloudRunner.close`) and waits for the starts and deliveries under way,
+   * so the database can close after them.
    */
   async stop(): Promise<void> {
     this.stopping.abort();
+    // Its cloud sessions' turns too: none writes once the database closes.
+    await this.cloud?.close?.();
     await this.idle();
   }
 
@@ -2843,6 +2846,10 @@ export class Engine {
     const sessionId = q.sessionId!;
     const losses = this.losses.get(sessionId) ?? 0;
     const sent = this.track(`q:${q.id}`, async () => {
+      // `q` was read before this delivery was under way: a resume may have carried it since. (Its
+      // checks below read the database anyway; a chat message, sent at once, keeps its order instead.)
+      const [now] = await this.db.select({ deliveredAt: questions.deliveredAt }).from(questions).where(eq(questions.id, q.id));
+      if (now?.deliveredAt) return;
       q = await this.checkedAnswer(q);
       if (placement?.kind === "personal" && q.stepRunId && !(await this.personalAnswer(q))) return;
       if (q.orphaned && !(await this.admitCodexInput(sessionId, q.id))) return;

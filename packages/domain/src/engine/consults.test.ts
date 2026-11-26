@@ -297,9 +297,11 @@ test("a resumed session that asks again ends the consult of the session it repla
   const expertRun = await s.consulted(q.id);
   // The runner lost the session: it resumes, and its consult is orphaned (its answer would go as words).
   await s.emit(asker.sessionId, SESSION_NOT_RUNNING);
-  await vi.waitFor(async () => expect((await s.question(q.id)).orphaned).toBe(true));
+  await s.engine().idle();
+  expect((await s.question(q.id)).orphaned).toBe(true);
   // The resumed session asks again: the first consult ends, and its Job with it.
   const again = await s.consult(asker.sessionId, s.expert.id);
+  await s.engine().idle();
   expect((await s.question(q.id)).status).toBe("expired");
   expect(await s.run(expertRun)).toMatchObject({ status: "failed", error: STOPPED });
   expect(await s.consulted(again.id)).not.toBe(expertRun);
@@ -608,7 +610,9 @@ test("an event a consulted Job writes fires the asking agent's trigger, in the s
   const asker = await s.start();
   const q = await s.consult(asker.sessionId, s.expert.id);
   const expertRun = await s.consulted(q.id);
-  await callPlatformTool(s.context, { runId: expertRun, ownerId: s.context.ownerId, workspaceId: s.context.workspaceId, agentId: s.expert.id }, "rows_create", { tableId: backlog.id, values: { [title.id]: "Do it first" } });
+  // Its start has gone: the consulted Job works when it writes the row.
+  await s.engine().idle();
+  expect(await callPlatformTool(s.context, { runId: expertRun, ownerId: s.context.ownerId, workspaceId: s.context.workspaceId, agentId: s.expert.id }, "rows_create", { tableId: backlog.id, values: { [title.id]: "Do it first" } })).toMatchObject({ ok: true });
   await new Scheduler(s.context.db, s.engine()).tick();
   const [job] = await s.context.db.select().from(runs).where(eq(runs.triggerId, next.id));
   expect(job).toMatchObject({ agentId: s.asker.id, rootId: (await s.run(asker.runId)).rootId });
