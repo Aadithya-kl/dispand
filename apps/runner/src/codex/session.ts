@@ -133,6 +133,8 @@ export function startCodexSession(start: CodexSessionStart, cwd: string, session
   const steers = new Map<string, { text: string; settle: (outcome: "steered" | "queued") => void }>();
   /** The text of the turn's last agent message: its result. */
   let lastText = "";
+  /** The agent message whose text went out last: another one's opens a message of its own. */
+  let textItem: string | undefined;
   const inFlight = new Map<string, string>();
   /** The changes of each file change item, as last reported: what its approval is about. */
   const fileChanges = new Map<string, FileUpdateChange[]>();
@@ -244,7 +246,9 @@ export function startCodexSession(start: CodexSessionStart, cwd: string, session
     } else if (n.method === "item/fileChange/patchUpdated") {
       fileChanges.set(n.params.itemId, n.params.changes);
     } else if (n.method === "item/agentMessage/delta") {
-      if (n.params.threadId === threadId) emit({ type: "text", delta: n.params.delta });
+      if (n.params.threadId !== threadId) return;
+      emit({ type: "text", delta: n.params.delta, ...(n.params.itemId !== textItem ? { start: true as const } : {}) });
+      textItem = n.params.itemId;
     } else if (n.method === "turn/started") {
       if (n.params.threadId === threadId && running) learnTurn(n.params.turn.id);
     } else if (n.method === "turn/completed") {
