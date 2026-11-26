@@ -1,5 +1,5 @@
 export { closeDb, createDb, migrateDb, openDb, pingDb, type Db } from "./db/client.ts";
-export { currentScope, inScope, shared, SYSTEM, type Ambient, type Scope, type Tenancy } from "./db/scope.ts";
+export { currentScope, inScope, shared, SYSTEM, type Ambient, type OrganizationRefusal, type Scope, type Tenancy } from "./db/scope.ts";
 export { newId } from "./ids.ts";
 export { createAuth, type Auth } from "./auth.ts";
 export { router, type Router } from "./rpc/router.ts";
@@ -37,3 +37,4 @@ export { handleRunnerAttachment } from "./runners/attachments.ts";
 
 export { flushTelemetry, startTelemetry, stopTelemetry } from "./telemetry/index.ts";
 export { bootstrapOrganization } from "./workspace/lifecycle.ts";
+export { answerRefusal } from "./workspace/gate.ts";
