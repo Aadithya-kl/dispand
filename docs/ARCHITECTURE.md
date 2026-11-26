@@ -240,21 +240,28 @@
   `onHarnessEvent` only writes and returns; replays are dropped per step run by `event_seq`
   (the highest runner seq handled, raised in the same transaction as the event's effects), and
   only the session's own runner may report on it. Starts, answers and chat messages
-  carry `delivered_at` (`start_delivered_at`), set once the hub wrote them. On boot `recover()`
+  carry `delivered_at` (`start_delivered_at`), set once the hub wrote them. An answer or a chat
+  message is claimed right before it goes (`claimInputs` sets `delivering` where it is still
+  undelivered and unclaimed): of the paths that decided on a row read earlier, only the first to
+  claim it sends it. A resume's prompt claims what it carries the same way, taking over writes
+  still under way. A write that didn't reach the session, or went to one lost meanwhile, gives
+  its claim back, and so does a resume whose start wasn't written; a claim of a process that
+  stopped is free again. A session's deliveries go one after another in the order they were
+  asked for (`inSession`), whatever each awaits before its write. On boot `recover()`
   continues active runs; on every runner `hello`, once caught up (a session that ended meanwhile
   is closed by then), `reconcile` handles each open session on it: live → undelivered answers and
   messages go now; lost after its start was written (or after any event of it: the start
   arrived though its write wasn't recorded) → resumed from its CLI session id with a prompt
   carrying every answer and chat message written since its start or last resume (no event proves
-  which of them it read, so it may get some twice; a write still under way then doesn't mark
-  its row delivered; pending questions become `orphaned`: their
+  which of them it read, so it may get some twice; a write still under way then gives its row
+  back; pending questions become `orphaned`: their
   answer goes as a message); start never written → sent once. It decides on each step as read
   again once no start of it is under way, and leaves a start written after the runner turned
   ready (its list of live sessions predates it). Every start is claimed in the process first
   (`claimStart`), then reads its step again: one decided on a row read before another start of
   it was written sends nothing. Answers and chat messages asked
   for during a reconcile, or while the runner's "session is not running" error resumes the
-  session, are delivered after it, against the rows it left; "already running" counts as a
+  session, wait in their turn and go after it, against the rows it left; "already running" counts as a
   delivered start. A completed step's
   pending questions expire, and a resumed session's new question expires the orphaned ones.
   Events for closed steps are ignored. `runs.stream` is an oRPC event iterator: a snapshot,

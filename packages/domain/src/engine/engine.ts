@@ -218,11 +218,26 @@ export class Engine {
    * the push sender, whose flush spans every workspace.
    */
   readonly questionChanges = new EventPublisher<Record<string | typeof ANY_WORKSPACE, true>>({ maxBufferedEvents: 1 });
-  /** Starts, answers and chat messages handed to the adapter and not settled yet: never sent twice at once. */
+  /** Session starts (`start:`, see `claimStart`) and Tool calls (`tool:`) under way: never two at once. */
   private readonly inFlight = new Set<string>();
-  /** Reconciles under way: answers and chat messages wait for them (see `deliverAnswer`). */
+  /** Per session, its last delivery asked for: each goes once the one before it settled (`inSession`). */
+  private readonly lanes = new Map<string, Promise<void>>();
+  /**
+   * What this engine's delivery claims start with (`claimInputs`): a claim of another engine, one of
+   * a process that stopped, never went and is free again. One engine runs per database (its starts
+   * are claimed in the process too, `claimStart`).
+   */
+  private readonly instance = newId("eng");
+  private claimed = 0;
+  /** This engine's claims whose giving back failed: free again too. */
+  private readonly abandoned = new Set<string>();
+  /** Reconciles under way: answers and chat messages wait for them (see `inSession`). */
   private reconciling = 0;
-  private readonly deferred: (() => void)[] = [];
+  /** Settles once no reconcile is under way (`holdingDeliveries`). */
+  private reconciled = Promise.resolve();
+  /** Reconciles begun so far: a delivery waiting its turn meanwhile reads its rows again. */
+  private reconciles = 0;
+  private reconcilesDone = () => {};
   /** Times each session was found lost: a delivery written before the last one doesn't count. */
   private readonly losses = new Map<string, number>();
   /** Starts and deliveries running without being awaited, until they settle: `stop()` waits for them. */
@@ -1900,11 +1915,12 @@ export class Engine {
 
   /** Runs `work` with answers and chat messages held; those asked for meanwhile go after it, against the rows it left. */
   private async holdingDeliveries<T>(work: () => Promise<T>): Promise<T> {
-    this.reconciling++;
+    this.reconciles++;
+    if (this.reconciling++ === 0) this.reconciled = new Promise((resolve) => (this.reconcilesDone = resolve));
     try {
       return await work();
     } finally {
-      if (--this.reconciling === 0) for (const retry of this.deferred.splice(0)) retry();
+      if (--this.reconciling === 0) this.reconcilesDone();
     }
   }
 
@@ -1963,43 +1979,65 @@ export class Engine {
       // Even her own: the request it answers lived in the lost worker, and no replacement restores it (explicit recovery).
       if (answered.length) return this.pausePersonal(step.id, { kind: "resume" }, "worker");
     }
-    const unsent = await undeliveredMessages(this.db, step.id);
-    const { prompt, answers, messages: carried, laterAnswers, laterMessages } = resumePrompt(
-      step.cliSessionId ? null : step.start!.prompt,
-      answered,
-      step.harness?.kind === "codex" ? unsent.slice(0, 1) : unsent,
-      waiting,
-    );
-    if (step.harness?.kind === "codex") {
-      laterMessages.push(...unsent.slice(1));
-      await this.db.update(stepRuns).set({ codexInputId: carried[0]?.id ?? null }).where(eq(stepRuns.id, step.id));
-    }
-    let start: StartParams;
-    if (step.cliSessionId) start = { ...step.start!, prompt, resumeCliSessionId: step.cliSessionId };
-    else {
-      // Nothing to resume (the CLI never reported its session): start afresh, in a new folder,
-      // since the runner may have created the first one before it stopped.
-      const runKey = `${step.runId}-${step.id}-${Date.now().toString(36)}`;
-      await this.db.update(stepRuns).set({ start: { ...step.start!, runKey } }).where(eq(stepRuns.id, step.id));
-      start = { ...step.start!, runKey, prompt };
-    }
-    // What the prompt carries is held, so no separate delivery sends it too.
-    const held = [...answers.map((q) => `q:${q.id}`), ...carried.map((m) => `m:${m.id}`)];
-    // Its run may have been stopped since the step was read: a stopped run never starts again.
-    // Read right before the launch, so a stop is either seen here or sent after this start.
-    const [now] = await this.db.select({ status: stepRuns.status }).from(stepRuns).where(eq(stepRuns.id, step.id));
-    if (!now || !ACTIVE_STEP.includes(now.status)) return;
-    if (await this.refusedForScope(step)) return;
-    await this.auditResume(step);
-    await this.launch(step.harness!, start, step, held, async () => {
-      const now = new Date();
-      if (answers.length) await this.db.update(questions).set({ deliveredAt: now }).where(inArray(questions.id, answers.map((q) => q.id)));
-      if (carried.length) await this.db.update(messages).set({ deliveredAt: now }).where(inArray(messages.id, carried.map((m) => m.id)));
-      if (step.resumeAfterSession) {
+    // The prompt carries what it claims, as a delivery would (`claimInputs`): not what another path
+    // sent since it was read, and no delivery sends it too; a write still under way goes in it too.
+    // What doesn't fit goes back at once, to follow as messages; what it carries is delivered once
+    // the start is written, and goes back otherwise.
+    const token = this.claimToken();
+    const unwritten = () => this.endClaim(token, async () => {
+      await this.giveBack(questions, token);
+      await this.giveBack(messages, token);
+    });
+    let laterAnswers: QuestionRow[];
+    let laterMessages: MessageRow[];
+    try {
+      // As claimed, checked again: a consult taken back since it was read goes as its refusal.
+      const taken = new Map((await this.claimInputs(questions, answered.map((q) => q.id), sessionId, token, true)).map((q) => [q.id, q]));
+      const claimedAnswers = await Promise.all(answered.flatMap((q) => (taken.has(q.id) ? [this.checkedAnswer(taken.get(q.id)!)] : [])));
+      const read = await undeliveredMessages(this.db, step.id);
+      const claimed = new Set((await this.claimInputs(messages, read.map((m) => m.id), sessionId, token, true)).map((m) => m.id));
+      const unsent = read.filter((m) => claimed.has(m.id));
+      const built = resumePrompt(
+        step.cliSessionId ? null : step.start!.prompt,
+        claimedAnswers,
+        step.harness?.kind === "codex" ? unsent.slice(0, 1) : unsent,
+        waiting,
+      );
+      ({ laterAnswers, laterMessages } = built);
+      if (step.harness?.kind === "codex") {
+        laterMessages.push(...unsent.slice(1));
+        await this.db.update(stepRuns).set({ codexInputId: built.messages[0]?.id ?? null }).where(eq(stepRuns.id, step.id));
+      }
+      await this.giveBack(questions, token, laterAnswers);
+      await this.giveBack(messages, token, laterMessages);
+      let start: StartParams;
+      if (step.cliSessionId) start = { ...step.start!, prompt: built.prompt, resumeCliSessionId: step.cliSessionId };
+      else {
+        // Nothing to resume (the CLI never reported its session): start afresh, in a new folder,
+        // since the runner may have created the first one before it stopped.
+        const runKey = `${step.runId}-${step.id}-${Date.now().toString(36)}`;
+        await this.db.update(stepRuns).set({ start: { ...step.start!, runKey } }).where(eq(stepRuns.id, step.id));
+        start = { ...step.start!, runKey, prompt: built.prompt };
+      }
+      // Its run may have been stopped since the step was read: a stopped run never starts again.
+      // Read right before the launch, so a stop is either seen here or sent after this start.
+      const [now] = await this.db.select({ status: stepRuns.status }).from(stepRuns).where(eq(stepRuns.id, step.id));
+      if (!now || !ACTIVE_STEP.includes(now.status)) return;
+      if (await this.refusedForScope(step)) return;
+      await this.auditResume(step);
+      const written = async () => {
+        await this.endClaim(token, async () => {
+          await this.delivered(questions, token);
+          await this.delivered(messages, token);
+        });
+        if (!step.resumeAfterSession) return;
         await this.db.update(stepRuns).set({ resumeAfterSession: null, pendingAction: null }).where(and(eq(stepRuns.id, step.id), eq(stepRuns.sessionId, sessionId)));
         await this.flush(step);
-      }
-    }, claim);
+      };
+      await this.launch(step.harness!, start, step, written, claim, unwritten);
+    } finally {
+      if (!claim.handed) await unwritten();
+    }
     // What didn't fit follows as messages, after the start on the same connection. The resumed
     // session doesn't know the old question ids: those answers go as words too (orphaned).
     if (laterAnswers.length) {
@@ -2578,7 +2616,7 @@ export class Engine {
     this.publish([{ type: "step", step: stepView(started) }]);
     // Chat messages sent while it was queued go once the start is written (an unwritten one is
     // resent with them by the runner's reconcile).
-    await this.launch(harness, start, started, [], start.interactive ? () => this.flush(started) : undefined);
+    await this.launch(harness, start, started, start.interactive ? () => this.flush(started) : undefined);
   }
 
   /**
@@ -2586,7 +2624,7 @@ export class Engine {
    * waiting for it to arrive: every start, first or sent again, goes this way. It claims the
    * session's start first (`claimStart`), unless its caller holds `claim` for it.
    */
-  private async launch(harness: Harness, start: StartParams, step: StepRow, held: string[] = [], written?: () => Promise<void>, claim?: StartClaim) {
+  private async launch(harness: Harness, start: StartParams, step: StepRow, written?: () => Promise<void>, claim?: StartClaim, unwritten?: () => Promise<void>) {
     // A start already under way, or one written since `step` was read: this one would repeat it,
     // and its grant would end the one the other carries.
     const own = claim ?? (await this.claimStart(step));
@@ -2605,7 +2643,7 @@ export class Engine {
         await this.pausePersonal(step.id, { kind: step.startDeliveredAt ? "resume" : "start" }, issued.paused);
         return;
       }
-      own.handed = this.dispatch(harness, sent, step, held, written, issued?.grant);
+      own.handed = this.dispatch(harness, sent, step, written, issued?.grant, unwritten);
     } finally {
       if (!claim) own.end();
     }
@@ -2749,9 +2787,10 @@ export class Engine {
 
   /**
    * Hands a start as it is to the harness without waiting for it to arrive. Once written, the
-   * step records it (and `written` runs); unwritten, the runner's next reconcile sends it again.
+   * step records it (and `written` runs); unwritten (`unwritten` runs), the runner's next reconcile
+   * sends it again.
    */
-  private dispatch(harness: Harness, start: StartParams, step: StepRow, held: string[] = [], written?: () => Promise<void>, grant?: Grant): boolean {
+  private dispatch(harness: Harness, start: StartParams, step: StepRow, written?: () => Promise<void>, grant?: Grant, unwritten?: () => Promise<void>): boolean {
     // How the start ended, once it has: delivered, waiting for its runner, refused, or failed.
     const outcome = (result: string) => counts.counter("dispand.sessions.started").add(1, { "dispand.harness.kind": harness.kind, "dispand.result": result });
     // Out of the protocol's bounds, the runner would refuse it and every reconcile would resend it.
@@ -2765,22 +2804,22 @@ export class Engine {
       this.keep(failed);
       return false;
     }
-    for (const key of held) this.inFlight.add(key);
     // The session's start is claimed (`claimStart`): it is let go once this settles.
     const sent = (async () => {
-      if (!(await this.adapter.start(harness, start, grant))) return outcome("offline");
+      if (!(await this.adapter.start(harness, start, grant))) {
+        await unwritten?.();
+        return outcome("offline");
+      }
       await this.db.update(stepRuns).set({ startDeliveredAt: new Date() }).where(eq(stepRuns.id, step.id));
       await written?.();
       // Last: a failure above is counted once, as failed.
       outcome("ok");
     })()
-      .finally(() => {
-        this.inFlight.delete(`start:${step.sessionId}`);
-        for (const key of held) this.inFlight.delete(key);
-      })
+      .finally(() => this.inFlight.delete(`start:${step.sessionId}`))
       .catch(async (err: unknown) => {
       outcome("failed");
       logError("session start failed", err, { ref: step.id });
+      await unwritten?.().catch((e: unknown) => logError("session start's inputs not given back", e, { ref: step.id }));
       await this.failNow(step, stored("engine.fail.sessionNotStarted"));
     });
     this.keep(sent);
@@ -2836,55 +2875,149 @@ export class Engine {
   /** An answer reaches the session as an answer, or, for a question its lost session asked, as a message. */
   /** `placement`: its step's (a personal one checks its actor and enrollment again before it goes). */
   private deliverAnswer(q: QuestionRow, placement?: Placement | null) {
-    // A reconcile may be resuming this session: deliver once it is done, against the row as it left it.
-    if (this.reconciling > 0) {
-      // In the answer's run's scope, not in the reconciling runner's.
-      this.deferred.push(() => this.keep(inRunScope(this.db, q.runId, () => this.redeliverAnswer(q.id))));
-      return;
-    }
     // Only a session's questions are delivered (a checkpoint's Approval has none).
     const sessionId = q.sessionId!;
-    const losses = this.losses.get(sessionId) ?? 0;
-    const sent = this.track(`q:${q.id}`, async () => {
-      // `q` was read before this delivery was under way: a resume may have carried it since. (Its
-      // checks below read the database anyway; a chat message, sent at once, keeps its order instead.)
-      const [now] = await this.db.select({ deliveredAt: questions.deliveredAt }).from(questions).where(eq(questions.id, q.id));
-      if (now?.deliveredAt) return;
-      q = await this.checkedAnswer(q);
-      if (placement?.kind === "personal" && q.stepRunId && !(await this.personalAnswer(q))) return;
-      if (q.orphaned && !(await this.admitCodexInput(sessionId, q.id))) return;
-      // Who answered goes with the answer itself: an agent's is never shown as the owner's.
-      const ok = q.orphaned
-        ? await this.adapter.send(sessionId, answerText(q))
-        : q.answeredBy?.type === "agent"
-          ? await this.adapter.answer(sessionId, q.runnerQuestionId!, q.answer!, q.answeredBy)
-          : await this.adapter.answer(sessionId, q.runnerQuestionId!, q.answer!);
-      if (ok && (this.losses.get(sessionId) ?? 0) === losses) await this.db.update(questions).set({ deliveredAt: new Date() }).where(eq(questions.id, q.id));
-    }).catch((err: unknown) => logError("answer delivery failed", err, { ref: q.id }));
-    this.keep(sent);
+    this.inSession(sessionId, q.runId, async (again) => {
+      if (again) {
+        const [row] = await this.db.select({ q: questions, step: stepRuns }).from(questions).innerJoin(stepRuns, eq(stepRuns.id, questions.stepRunId)).where(eq(questions.id, q.id));
+        if (row?.q.status !== "answered" || !holdsSlot(row.step)) return;
+        placement = row.step.placement;
+      }
+      await this.sendClaimed(questions, q.id, sessionId, q.runId, q.stepRunId!, async (row) => {
+        const checked = await this.checkedAnswer(row);
+        if (placement?.kind === "personal" && checked.stepRunId && !(await this.personalAnswer(checked))) return false;
+        if (checked.orphaned && !(await this.admitCodexInput(sessionId, checked.id))) return false;
+        // Who answered goes with the answer itself: an agent's is never shown as the owner's.
+        return checked.orphaned
+          ? this.adapter.send(sessionId, answerText(checked))
+          : checked.answeredBy?.type === "agent"
+            ? this.adapter.answer(sessionId, checked.runnerQuestionId!, checked.answer!, checked.answeredBy)
+            : this.adapter.answer(sessionId, checked.runnerQuestionId!, checked.answer!);
+      });
+    }, (err) => logError("answer delivery failed", err, { ref: q.id }));
   }
 
   /** `steer`: the turn it joins while that turn runs (`steerQueued`); a redelivery sends it as any message. */
   private deliverMessage(step: StepRow, m: MessageRow, steer?: string) {
     const sessionId = step.sessionId!;
-    if (this.reconciling > 0) {
-      this.deferred.push(() => this.keep(inRunScope(this.db, m.runId, () => this.redeliverMessage(m.id))));
-      return;
-    }
-    const losses = this.losses.get(sessionId) ?? 0;
-    const sent = this.track(`m:${m.id}`, async () => {
-      if (step.placement?.kind === "personal" && !(await this.personalUse(step.id))) return;
-      if (!steer && step.harness?.kind === "codex" && !(await this.admitCodexInput(sessionId, m.id))) return;
-      const files = m.files ?? [];
-      const delivered = steer && this.adapter.steer ? await this.adapter.steer(sessionId, steer, m.id, m.text, files) : await this.adapter.send(sessionId, m.text, files);
-      if (delivered && (this.losses.get(sessionId) ?? 0) === losses) {
-        await this.db.update(messages).set({ deliveredAt: new Date() }).where(eq(messages.id, m.id));
+    this.inSession(sessionId, m.runId, async (again) => {
+      if (again) {
+        const [row] = await this.db.select({ step: stepRuns }).from(messages).innerJoin(stepRuns, eq(stepRuns.id, messages.stepRunId)).where(eq(messages.id, m.id));
+        if (row?.step.sessionId !== sessionId || !holdsSlot(row.step)) return;
+        // A steer joins its turn while that turn still runs; otherwise it goes as any message.
+        if (row.step.turnId !== steer || row.step.turnStatus !== "running") steer = undefined;
+        ({ step } = row);
       }
+      const delivered = await this.sendClaimed(messages, m.id, sessionId, m.runId, step.id, async (row) => {
+        if (step.placement?.kind === "personal" && !(await this.personalUse(step.id))) return false;
+        if (!steer && step.harness?.kind === "codex" && !(await this.admitCodexInput(sessionId, row.id))) return false;
+        const files = row.files ?? [];
+        return steer && this.adapter.steer ? this.adapter.steer(sessionId, steer, row.id, row.text, files) : this.adapter.send(sessionId, row.text, files);
+      });
       // Sent as any message (a redelivery), or a steer that never reached the harness (it goes
       // again as any message): no steer-result will settle it.
-      if (!steer || !delivered) await this.db.update(chatQueue).set({ state: "dispatched", updatedAt: new Date() }).where(and(eq(chatQueue.id, m.id), eq(chatQueue.state, "steering")));
-    }).catch((err: unknown) => logError("chat message delivery failed", err, { ref: m.id }));
-    this.keep(sent);
+      if (delivered !== undefined && (!steer || !delivered)) await this.db.update(chatQueue).set({ state: "dispatched", updatedAt: new Date() }).where(and(eq(chatQueue.id, m.id), eq(chatQueue.state, "steering")));
+    }, (err) => logError("chat message delivery failed", err, { ref: m.id }));
+  }
+
+  /**
+   * Runs a delivery to the session once those asked for before it have settled: whatever each awaits
+   * before its write (its checks, its claim, the adapter's own reads), the session gets its answers
+   * and chat messages in the order they were asked for. One asked for during a reconcile (it may be
+   * resuming this session), or waiting its turn while one ran, waits for it, then goes `again`:
+   * against the rows it left, read anew, in its run's scope (`runId`), not in the reconciling runner's.
+   */
+  private inSession(sessionId: string, runId: string, deliver: (again: boolean) => Promise<void>, failed: (err: unknown) => void) {
+    const during = this.reconciling > 0;
+    const seen = this.reconciles;
+    const turn = (this.lanes.get(sessionId) ?? Promise.resolve())
+      .then(async () => {
+        if (!during && !this.reconciling && this.reconciles === seen) return deliver(false);
+        while (this.reconciling) await this.reconciled;
+        return inRunScope(this.db, runId, () => deliver(true));
+      })
+      .catch(failed);
+    this.lanes.set(sessionId, turn);
+    this.keep(turn.finally(() => {
+      if (this.lanes.get(sessionId) === turn) this.lanes.delete(sessionId);
+    }));
+  }
+
+  /**
+   * The one place an answer or a chat message goes to its session, decided then: once its root goes
+   * on (paused meanwhile, its step waits for it, holding no slot), and only if it claims the row.
+   * `write` checks the row as claimed, then writes it: true once it reached the session. A write that
+   * reached it delivers the row; one that didn't, threw, or went to a session lost meanwhile gives it
+   * back. Returns what `write` did, or nothing when it didn't run.
+   */
+  private async sendClaimed<T extends typeof messages | typeof questions>(table: T, id: string, sessionId: string, runId: string, stepId: string, write: (row: T["$inferSelect"]) => Promise<boolean>): Promise<boolean | undefined> {
+    if (!(await rootGoing(this.db, runId))) {
+      // Held once: a second hold would take for a handed slot the one a turn under way keeps.
+      const [step] = await this.db.select({ pendingAction: stepRuns.pendingAction }).from(stepRuns).where(eq(stepRuns.id, stepId));
+      if (step && !step.pendingAction) await this.holdNow(stepId, { kind: "deliver" });
+      return undefined;
+    }
+    const losses = this.losses.get(sessionId) ?? 0;
+    const token = this.claimToken();
+    let ok = false;
+    try {
+      const [row] = await this.claimInputs(table, [id], sessionId, token);
+      if (!row) return undefined;
+      ok = await write(row);
+      return ok;
+    } finally {
+      const reached = ok && (this.losses.get(sessionId) ?? 0) === losses;
+      await this.endClaim(token, () => (reached ? this.delivered(table, token) : this.giveBack(table, token)));
+    }
+  }
+
+  /**
+   * Claims answers or chat messages for `sessionId` right before they go to it, in its prompt or as
+   * writes (`delivering`): those still undelivered (a chat message, while its step still runs that
+   * session) that no claim of this engine still holds. The decision to send is this claim, never a row read
+   * earlier: of the paths that decided on one, only the first to claim it sends it. A resume
+   * (`takeOver`) also takes those whose write is under way: it carries them, as a write to the session
+   * it replaces proves nothing. Returns the rows claimed, as they are now.
+   */
+  private async claimInputs<T extends typeof messages | typeof questions>(table: T, ids: string[], sessionId: string, token: string, takeOver = false): Promise<T["$inferSelect"][]> {
+    if (!ids.length) return [];
+    const still = table === messages
+      ? inArray(messages.stepRunId, this.db.select({ id: stepRuns.id }).from(stepRuns).where(and(eq(stepRuns.sessionId, sessionId), inArray(stepRuns.status, ACTIVE_STEP))))
+      : eq(questions.sessionId, sessionId);
+    const free = takeOver
+      ? undefined
+      : or(isNull(table.delivering), sql`not starts_with(${table.delivering}, ${`${this.instance}:`})`, this.abandoned.size ? inArray(table.delivering, [...this.abandoned]) : undefined);
+    return (await this.db
+      .update(table as typeof messages)
+      .set({ delivering: token })
+      .where(and(inArray(table.id, ids), isNull(table.deliveredAt), free, still))
+      .returning()) as T["$inferSelect"][];
+  }
+
+  /** A new claim, held until it ends (`endClaim`). */
+  private claimToken(): string {
+    return `${this.instance}:${++this.claimed}`;
+  }
+
+  /** Ends a claim once `settle` delivered or gave back its rows; failing that, its rows are free again. */
+  private async endClaim(token: string, settle: () => Promise<void>) {
+    try {
+      await settle();
+    } catch (err) {
+      this.abandoned.add(token);
+      throw err;
+    }
+  }
+
+  /** A claim's rows reached the session: delivered, unless another claim took them since. */
+  private async delivered(table: typeof messages | typeof questions, token: string) {
+    await this.db.update(table).set({ deliveredAt: new Date(), delivering: null }).where(eq(table.delivering, token));
+  }
+
+  /** A claim's rows (or those of `rows`) go back, unless another claim took them since. */
+  private async giveBack(table: typeof messages | typeof questions, token: string, rows?: { id: string }[]) {
+    if (rows && !rows.length) return;
+    await this.db.update(table).set({ delivering: null }).where(and(eq(table.delivering, token), rows ? inArray(table.id, rows.map((r) => r.id)) : undefined));
   }
 
   /** Only one native input is admitted per turn, including the gap before turn-start arrives. */

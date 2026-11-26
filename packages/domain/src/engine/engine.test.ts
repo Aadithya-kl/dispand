@@ -82,6 +82,7 @@ test("Codex admits queued followups only after turn end and harness capacity", a
   const session = adapter.starts[0]!.start.sessionId;
   await engine.sendChat(runId, "First followup");
   await engine.sendChat(runId, "Second followup");
+  await engine.idle();
   expect(adapter.sent).toEqual([]);
   await emit(session, { type: "turn-start", turnId: "initial", interruptible: true });
   await emit(session, { type: "question", questionId: "approval", payload: { kind: "confirm-outputs", values: {} } });
@@ -102,6 +103,7 @@ test("Codex admits queued followups only after turn end and harness capacity", a
   await engine.stopRun(otherRun);
   await vi.waitFor(() => expect(adapter.sent).toEqual([[session, "First followup"]]));
   await engine.sendChat(runId, "Third followup");
+  await engine.idle();
   expect(adapter.sent).toHaveLength(1);
   await emit(session, { type: "turn-start", turnId: "next", interruptible: true });
   await emit(session, { type: "turn-end", turnId: "next" });
@@ -169,6 +171,7 @@ test("Codex admits a resumed question's answer before queued chat messages", asy
   const [question] = await context.db.select().from(questions).where(eq(questions.runId, runId));
   await engine.answer(question!.id, { kind: "confirm-outputs", confirmed: false });
   await engine.sendChat(runId, "Next input");
+  await engine.idle();
   expect(adapter.sent).toEqual([]);
   await emit(session, { type: "turn-start", turnId: "resumed", interruptible: true });
   await emit(session, { type: "turn-end", turnId: "resumed" });
@@ -535,6 +538,7 @@ test("a cloud chat queues during its turn and sends at the turn's end", async ()
   const { adapter, engine, runId, sessionId, queue } = await busyChat();
   await engine.db.update(stepRuns).set({ runnerId: CLOUD_SOURCE }).where(eq(stepRuns.sessionId, sessionId));
   await engine.sendChat(runId, "Cloud followup");
+  await engine.idle();
   expect(adapter.sent).toEqual([]);
   await engine.onHarnessEvent(sessionId, { type: "turn-end", turnId: "first" }, { runnerId: CLOUD_SOURCE, seq: 100 });
   await vi.waitFor(() => expect(adapter.sent).toEqual([[sessionId, "Cloud followup"]]));
@@ -768,6 +772,7 @@ test("chat run waits for outputs then starts the step with rendered prompt", asy
   await emit(chatSession, { type: "text", delta: "shall we build?" });
   await emit(chatSession, { type: "turn-end" });
   await engine.sendChat(runId, "A chat app for teams");
+  await engine.idle();
   expect(adapter.sent).toEqual([[chatSession, "A chat app for teams"]]);
   expect(adapter.starts).toHaveLength(1);
 
@@ -907,12 +912,17 @@ async function delivered(engine: Engine, table: typeof questions | typeof messag
   });
 }
 
-async function startDelivered(engine: Engine, sessionId: string) {
-  await vi.waitFor(async () => {
+/** When the session's start was written, once it was. */
+async function startDelivered(engine: Engine, sessionId: string): Promise<Date> {
+  return vi.waitFor(async () => {
     const [row] = await engine.db.select({ at: stepRuns.startDeliveredAt }).from(stepRuns).where(eq(stepRuns.sessionId, sessionId));
     expect(row!.at).toBeInstanceOf(Date);
+    return row!.at!;
   });
 }
+
+/** A runner's report made after `written`: one made in the same millisecond can't speak to that start (`reconcile`). */
+const after = (written: Date) => new Date(written.getTime() + 1);
 
 test("run survives engine restart", async () => {
   const { context, adapter, engine, emit, workflow, runnerId } = await setup(chatThenStep);
@@ -1034,8 +1044,7 @@ test("runner restart while the app runs: steps resume, and a pending question's 
     questionId: "rq_1",
     payload: { kind: "permission", toolName: "Bash", input: { command: "ls" }, canAlwaysAllow: false },
   });
-  await startDelivered(engine, sessionId);
-  await engine.reconcile(runnerId, []);
+  await engine.reconcile(runnerId, [], after(await startDelivered(engine, sessionId)));
   await engine.idle();
   expect(adapter.starts).toHaveLength(3);
   expect(adapter.starts[2]!.start.prompt).toContain("Still waiting for the owner: permission to use Bash");
@@ -1266,6 +1275,7 @@ test("chat sent before the start reached the runner follows the start when the r
   adapter.online = false;
   const runId = await engine.startRun(workflow.id);
   await engine.sendChat(runId, "Hello");
+  await engine.idle();
   const chatSession = adapter.starts[0]!.start.sessionId;
   adapter.online = true;
   await engine.reconcile(runnerId, []);
@@ -1311,6 +1321,7 @@ test("a lost chat resumes with what fits the prompt limit; the rest follows as m
   adapter.online = false;
   await engine.sendChat(runId, "a".repeat(100_000));
   await engine.sendChat(runId, "b".repeat(100_000));
+  await engine.idle();
   adapter.online = true;
   adapter.sent = [];
   await engine.reconcile(runnerId, []);
@@ -1348,8 +1359,7 @@ test("a session lost before its CLI session id came starts again in a fresh fold
   const { adapter, engine, workflow, runnerId } = await setup(buttonThenStep);
   await engine.startRun(workflow.id);
   const first = adapter.starts[0]!.start;
-  await startDelivered(engine, first.sessionId);
-  await engine.reconcile(runnerId, []);
+  await engine.reconcile(runnerId, [], after(await startDelivered(engine, first.sessionId)));
   await engine.idle();
   const again = adapter.starts[1]!.start;
   expect(again.resumeCliSessionId).toBeUndefined();
@@ -2101,6 +2111,7 @@ test("a chat Job talks like a chat trigger", async () => {
   expect(adapter.starts).toHaveLength(1);
   expect(adapter.starts[0]!.start).toMatchObject({ prompt: "Help with the mail.", interactive: true, expectedOutputs: [] });
   await engine.sendChat(runId, "Anything urgent?");
+  await engine.idle();
   expect(adapter.sent).toEqual([[adapter.starts[0]!.start.sessionId, "Anything urgent?"]]);
 });
 
@@ -3044,6 +3055,125 @@ test.each(["resume", "launch"] as const)("a start decided by %s on a step read b
   else await internals.launch(read.harness!, read.start!, read);
   await engine.idle();
   expect(adapter.starts).toHaveLength(2);
+});
+
+/** A chat waiting on its question, with "Make it small." written while its runner was away (not delivered). */
+async function chatWithUnsent() {
+  const env = await setup(chatThenStep);
+  const runId = await env.engine.startRun(env.workflow.id);
+  const sessionId = env.adapter.starts[0]!.start.sessionId;
+  await startDelivered(env.engine, sessionId);
+  await env.emit(sessionId, { type: "cli-session", cliSessionId: "cli_1" });
+  await env.emit(sessionId, { type: "question", questionId: "rq_1", payload: { kind: "choice", questions: [{ question: "Who for?", header: "Audience", options: [{ label: "Teams" }], multiSelect: false }] } });
+  const [question] = await env.context.db.select().from(questions).where(eq(questions.runId, runId));
+  env.adapter.online = false;
+  await env.engine.sendChat(runId, "Make it small.");
+  await env.engine.idle();
+  env.adapter.online = true;
+  env.adapter.sent.length = 0;
+  const [message] = await env.context.db.select().from(messages).where(and(eq(messages.runId, runId), eq(messages.role, "user")));
+  expect(message!.deliveredAt).toBeNull();
+  const answer = () => env.engine.answer(question!.id, { kind: "choice", answers: { "Who for?": "Teams" } });
+  const sent = () => env.adapter.sent.filter(([, text]) => text === "Make it small.");
+  return { ...env, sessionId, message: message!, answer, sent };
+}
+
+// The owner answers (its flush sends what the chat missed) while the runner's reconcile sends it
+// too (after the reconcile, as a redelivery). Whichever decided on a row read before the other
+// sent it sends nothing.
+test.each(["flush", "redelivery"] as const)("a chat message read undelivered by one path while another sends it goes once (the %s read first)", async (first) => {
+  const { context, engine, runnerId, sessionId, message, answer, sent } = await chatWithUnsent();
+  if (first === "flush") {
+    const read = holdQuery(context.db, /from "messages" where .*"messages"\."delivered_at" is null/, "after");
+    const answering = answer();
+    await read.held;
+    await engine.reconcile(runnerId, [sessionId]);
+    await delivered(engine, messages, message.id);
+    read.release();
+    await answering;
+  } else {
+    const read = holdQuery(context.db, /from "messages" inner join "step_runs"/, "after");
+    await engine.reconcile(runnerId, [sessionId]);
+    await read.held;
+    await answer();
+    // Sent at once, the flush's delivery settles before the held read goes on (only that read is
+    // left). Waiting its turn behind the held read, it has nothing to settle.
+    const background = (engine as unknown as { background: Set<unknown> }).background;
+    if (sent().length) await vi.waitFor(() => expect(background.size).toBe(1));
+    read.release();
+  }
+  await engine.idle();
+  expect(sent()).toHaveLength(1);
+});
+
+test("a chat message a resume carries isn't sent by a delivery whose claim comes after the resume's", async () => {
+  const { context, adapter, engine, emit, workflow, runnerId } = await setup(chatThenStep);
+  const runId = await engine.startRun(workflow.id);
+  const sessionId = adapter.starts[0]!.start.sessionId;
+  await startDelivered(engine, sessionId);
+  await emit(sessionId, { type: "cli-session", cliSessionId: "cli_1" });
+  // The owner's message is about to be claimed when the runner comes back without the session.
+  const claim = holdQuery(context.db, /^update "messages" set "delivering"/, "before");
+  await engine.sendChat(runId, "Make it small.");
+  await claim.held;
+  let write!: () => void;
+  adapter.hold = new Promise((resolve) => (write = resolve));
+  try {
+    await engine.reconcile(runnerId, []);
+    expect(adapter.starts).toHaveLength(2);
+    expect(adapter.starts[1]!.start.prompt).toContain("The owner wrote: Make it small.");
+    // While the resume's start is still being written, the delivery's claim finds the message taken.
+    claim.release();
+    const background = (engine as unknown as { background: Set<unknown> }).background;
+    await vi.waitFor(() => expect(background.size).toBe(1));
+  } finally {
+    claim.release();
+    write();
+  }
+  await engine.idle();
+  expect(adapter.sent).toEqual([]);
+  const [row] = await context.db.select().from(messages).where(and(eq(messages.runId, runId), eq(messages.role, "user")));
+  expect(row).toMatchObject({ delivering: null, deliveredAt: expect.any(Date) });
+});
+
+test("a steer asked for during a reconcile still joins its turn when that turn runs on", async () => {
+  const { context, adapter, engine, runnerId, runId, sessionId } = await busyChat();
+  const { queuedId } = await engine.sendChat(runId, "Also add tests.");
+  // The runner reconnects, still running the turn; the owner sends the queued message into it meanwhile.
+  const listing = holdQuery(context.db, /from "step_runs" inner join "runs" .*"step_runs"\."runner_id" = /, "after");
+  const reconciled = engine.reconcile(runnerId, [sessionId]);
+  await listing.held;
+  await engine.steerQueued(runId, queuedId!);
+  listing.release();
+  await reconciled;
+  await engine.idle();
+  expect(adapter.steers).toEqual([[sessionId, "first", queuedId, "Also add tests."]]);
+  expect(adapter.sent).toEqual([]);
+});
+
+test("chat messages written while the runner was away reach the session in the order written", async () => {
+  const { context, adapter, engine, workflow, runnerId } = await setup(chatThenStep);
+  const runId = await engine.startRun(workflow.id);
+  const sessionId = adapter.starts[0]!.start.sessionId;
+  await startDelivered(engine, sessionId);
+  // As the hub's adapters do, a send reads where the session runs before it writes.
+  const send = adapter.send.bind(adapter);
+  adapter.send = async (id, text) => {
+    await context.db.select({ runnerId: stepRuns.runnerId }).from(stepRuns).where(eq(stepRuns.sessionId, id));
+    return send(id, text);
+  };
+  for (let round = 1; round <= 10; round++) {
+    adapter.online = false;
+    await engine.sendChat(runId, `First ${round}`);
+    await engine.sendChat(runId, `Second ${round}`);
+    await engine.idle();
+    adapter.online = true;
+    adapter.sent.length = 0;
+    // The runner is back: what it missed goes after the reconcile, the second after the first.
+    await engine.reconcile(runnerId, [sessionId]);
+    await engine.idle();
+    expect(adapter.sent.map(([, text]) => text)).toEqual([`First ${round}`, `Second ${round}`]);
+  }
 });
 
 test("stopping a reopened chat while it waits prevents a later exit acknowledgement from resuming it", async () => {
