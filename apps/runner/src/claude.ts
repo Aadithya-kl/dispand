@@ -637,6 +637,8 @@ export function startClaudeSession(
   }
 
   const toolNames = new Map<string, string>();
+  /** A message of the CLI's started and none of its text has gone out yet. */
+  let opening = false;
   const done = (async () => {
     try {
       for await (const msg of q) {
@@ -655,7 +657,13 @@ export function startClaudeSession(
         // Subagents' own text and tools stay inside the tool that runs them.
         else if (msg.type === "stream_event" && msg.parent_tool_use_id === null) {
           const e = msg.event;
-          if (e.type === "content_block_delta" && e.delta.type === "text_delta") emit({ type: "text", delta: e.delta.text });
+          // Each of the CLI's messages is its own: a message steered in mid-turn is answered in
+          // the next one, which must not be read as more of the answer before it.
+          if (e.type === "message_start") opening = true;
+          else if (e.type === "content_block_delta" && e.delta.type === "text_delta") {
+            emit({ type: "text", delta: e.delta.text, ...(opening ? { start: true as const } : {}) });
+            opening = false;
+          }
         } else if (msg.type === "assistant" && msg.parent_tool_use_id === null) {
           for (const block of msg.message.content) {
             if (block.type !== "tool_use") continue;
