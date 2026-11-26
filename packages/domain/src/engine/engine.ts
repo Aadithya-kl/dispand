@@ -2438,7 +2438,9 @@ export class Engine {
         await tx.update(stepRuns).set({ cliSessionId: event.cliSessionId }).where(eq(stepRuns.id, step.id));
         return null;
       case "text": {
-        const [last] = await tx
+        // A delta goes on the step's last row while that is the agent's, unless it opens a new
+        // message: a steered message's answer is a row of its own, not the end of the one before.
+        const [last] = event.start ? [] : await tx
           .select({ id: messages.id, role: messages.role })
           .from(messages)
           .where(eq(messages.stepRunId, step.id))
